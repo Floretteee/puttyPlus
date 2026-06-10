@@ -112,6 +112,12 @@ target_link_libraries(puttyplus
 set_target_properties(puttyplus PROPERTIES WIN32_EXECUTABLE ON)
 installed_program(puttyplus)
 
+# Generate putty.exe as a copy of puttyplus.exe for drop-in replacement
+add_custom_command(TARGET puttyplus POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:puttyplus>
+          ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/putty.exe
+  COMMENT "Copying puttyplus.exe → putty.exe")
+
 add_sources_from_current_dir(plink wsnet.c)
 
 # PuTTYPlus-Term - console mode SSH client with WebSocket transport for Windows Terminal

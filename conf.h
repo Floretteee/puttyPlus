@@ -160,7 +160,7 @@ CONF_OPTION(proxy_log_to_term,
 /* WebSocket proxy options */
 CONF_OPTION(ws_proxy_enable,
     VALUE_TYPE(BOOL),
-    DEFAULT_BOOL(true),
+    DEFAULT_BOOL(false),
     SAVE_KEYWORD("WSProxyEnable"),
 )
 CONF_OPTION(ws_proxy_host,

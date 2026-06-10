@@ -10,6 +10,29 @@
 #include <signal.h>
 
 #include "putty.h"
+
+/*
+ * Check if a hostname is a local/private IP address.
+ * Returns true for private IPv4 ranges (10.x.x.x, 172.16-31.x.x,
+ * 192.168.x.x, 127.x.x.x) and IPv6 loopback (::1).
+ * For hostnames (non-IP literals), returns false.
+ */
+static bool is_local_host(const char *host)
+{
+    unsigned int a, b, c, d;
+    int n;
+    if (sscanf(host, "%u.%u.%u.%u%n", &a, &b, &c, &d, &n) == 4 &&
+        n == (int)strlen(host)) {
+        if (a == 10) return true;
+        if (a == 172 && b >= 16 && b <= 31) return true;
+        if (a == 192 && b == 168) return true;
+        if (a == 127) return true;
+        if (a == 0) return true;
+        return false;
+    }
+    if (!strcmp(host, "::1")) return true;
+    return false;
+}
 #include "pageant.h" /* for AGENT_MAX_MSGLEN */
 #include "tree234.h"
 #include "storage.h"
@@ -824,7 +847,8 @@ static char *connect_to_host(
          * We're not a downstream, so open a normal socket.
          */
 
-        if (conf_get_bool(ssh->conf, CONF_ws_proxy_enable)) {
+        if (conf_get_bool(ssh->conf, CONF_ws_proxy_enable) &&
+            !is_local_host(host)) {
             *realhost = dupstr(host);
             ssh->fullhostname = dupstr(*realhost);
             ssh->s = ws_new_connection(
