@@ -514,10 +514,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
      * session, this will detour via the config box.)
      */
     gui_term_process_cmdline(wgs->conf, cmdline);
+    conf_cache_data(wgs);
 
     memset(&wgs->ucsdata, 0, sizeof(wgs->ucsdata));
-
-    conf_cache_data(wgs);
 
     /*
      * Guess some defaults for the window size. This all gets

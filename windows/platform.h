@@ -324,6 +324,16 @@ Socket *ws_new_connection(const char *hostname, int port,
                           Plug *plug, Conf *conf);
 
 /*
+ * Exports from wsseat.c - Terminal-mode Seat
+ */
+typedef struct WsSeat WsSeat;
+extern const SeatVtable ws_seat_vt;
+WsSeat *ws_seat_new(Conf *conf, LogContext *logctx);
+void ws_seat_start_backend(WsSeat *ws);
+int ws_seat_run_main_loop(WsSeat *ws);
+void ws_seat_cleanup(WsSeat *ws);
+
+/*
  * network.c dynamically loads WinSock 2 or WinSock 1 depending on
  * what it can get, which means any WinSock routines used outside
  * that module must be exported from it as function pointers. So

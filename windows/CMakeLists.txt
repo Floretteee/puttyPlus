@@ -87,9 +87,11 @@ add_sources_from_current_dir(plink no-jump-list.c nohelp.c plink.rc)
 add_dependencies(plink generated_licence_h)
 
 add_sources_from_current_dir(pscp no-jump-list.c nohelp.c pscp.rc)
+add_sources_from_current_dir(pscp wsnet.c)
 add_dependencies(pscp generated_licence_h)
 
 add_sources_from_current_dir(psftp no-jump-list.c nohelp.c psftp.rc)
+add_sources_from_current_dir(psftp wsnet.c)
 add_dependencies(psftp generated_licence_h)
 
 # PuTTYPlus - main GUI application with WebSocket transport
@@ -111,6 +113,13 @@ set_target_properties(puttyplus PROPERTIES WIN32_EXECUTABLE ON)
 installed_program(puttyplus)
 
 add_sources_from_current_dir(plink wsnet.c)
+
+# PuTTYPlus-Term - console mode SSH client with WebSocket transport for Windows Terminal
+add_sources_from_current_dir(puttyplus-term
+  wsseat.c wsnet.c no-jump-list.c nohelp.c plink.rc)
+
+# test_conf also needs wsnet.c because sshclient references ws_new_connection
+add_sources_from_current_dir(test_conf wsnet.c)
 
 target_sources(puttyplus PRIVATE ${CMAKE_SOURCE_DIR}/otherbackends/testback.c)
 

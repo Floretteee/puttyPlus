@@ -121,6 +121,17 @@ target_link_libraries(plink
   ${platform_libraries})
 installed_program(plink)
 
+# PuTTYPlus-Term - console SSH client with WebSocket transport
+add_executable(puttyplus-term
+  ${platform}/puttyplus-term.c
+  stubs/no-lineedit.c)
+be_list(puttyplus-term PuTTYPlus-Term SSH)
+target_link_libraries(puttyplus-term
+  noterminal eventloop console sshclient settings network crypto
+  utils
+  ${platform_libraries})
+installed_program(puttyplus-term)
+
 add_executable(pscp
   pscp.c)
 be_list(pscp PSCP SSH)
