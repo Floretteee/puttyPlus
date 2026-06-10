@@ -176,31 +176,6 @@ void win_setup_config_box(struct controlbox *b, HWND *hwndp, bool has_help,
                       "Steady", I(B_IND_STEADY));
 
     /*
-     * The sunken-edge border is a Windows GUI feature.
-     */
-    s = ctrl_getset(b, "Window/Appearance", "border",
-                    "Adjust the window border");
-    ctrl_checkbox(s, "Sunken-edge border (slightly thicker)", 's',
-                  HELPCTX(appearance_border),
-                  conf_checkbox_handler, I(CONF_sunken_edge));
-
-    /*
-     * Configurable font quality settings for Windows.
-     */
-    s = ctrl_getset(b, "Window/Appearance", "font",
-                    "Font settings");
-    ctrl_checkbox(s, "Allow selection of variable-pitch fonts", NO_SHORTCUT,
-                  HELPCTX(appearance_font), variable_pitch_handler, I(0));
-    ctrl_radiobuttons(s, "Font quality:", 'q', 2,
-                      HELPCTX(appearance_font),
-                      conf_radiobutton_handler,
-                      I(CONF_font_quality),
-                      "Antialiased", I(FQ_ANTIALIASED),
-                      "Non-Antialiased", I(FQ_NONANTIALIASED),
-                      "ClearType", I(FQ_CLEARTYPE),
-                      "Default", I(FQ_DEFAULT));
-
-    /*
      * Cyrillic Lock is a horrid misfeature even on Windows, and
      * the least we can do is ensure it never makes it to any other
      * platform (at least unless someone fixes it!).

@@ -1,12 +1,10 @@
 cmake_minimum_required(VERSION 3.7...3.28)
-project(putty LANGUAGES C)
+project(puttyPlus LANGUAGES C)
 
 set(CMAKE_C_STANDARD 99)
 
 include(cmake/setup.cmake)
 
-# Scan the docs directory first, so that when we start calling
-# installed_program(), we'll know if we have man pages available
 add_subdirectory(doc)
 
 add_compile_definitions(HAVE_CMAKE_H)
@@ -69,11 +67,6 @@ add_library(sftpclient STATIC
   psftpcommon.c)
 add_subdirectory(ssh)
 
-add_library(otherbackends STATIC
-  $<TARGET_OBJECTS:all-backends>
-  $<TARGET_OBJECTS:logging>)
-add_subdirectory(otherbackends)
-
 add_executable(testcrypt
   test/testcrypt.c sshpubk.c ssh/crc-attack-detector.c)
 target_link_libraries(testcrypt
@@ -117,17 +110,13 @@ add_executable(bidi_test
   terminal/bidi_test.c)
 target_link_libraries(bidi_test guiterminal utils ${platform_libraries})
 
+# Plink - command-line SSH client
 add_executable(plink
   ${platform}/plink.c
   stubs/no-lineedit.c)
-# Note: if we ever port Plink to a platform where we can't implement a
-# serial backend, this be_list command will need to become platform-
-# dependent, so that it only sets the SERIAL option on platforms where
-# that backend exists. For the moment, though, we have serial port
-# backends for both our platforms, so we can do this unconditionally.
-be_list(plink Plink SSH SERIAL OTHERBACKENDS)
+be_list(plink Plink SSH)
 target_link_libraries(plink
-  eventloop noterminal console sshclient otherbackends settings network crypto
+  eventloop noterminal console sshclient settings network crypto
   utils
   ${platform_libraries})
 installed_program(plink)
@@ -148,17 +137,6 @@ target_link_libraries(psftp
   ${platform_libraries})
 installed_program(psftp)
 
-add_executable(psocks
-  ${platform}/psocks.c
-  psocks.c
-  stubs/no-rand.c
-  proxy/nocproxy.c
-  proxy/nosshproxy.c
-  ssh/portfwd.c)
-target_link_libraries(psocks
-  eventloop console network utils
-  ${platform_libraries})
-
 add_executable(test_conf
   test/test_conf.c
   stubs/no-agent.c
@@ -167,20 +145,15 @@ add_executable(test_conf
   stubs/no-ldisc.c
   stubs/no-network.c
   stubs/no-timing.c
-  proxy/noproxy.c # FIXME: move this to stubs
+  proxy/noproxy.c
 )
-be_list(test_conf TestConf SSH SERIAL OTHERBACKENDS)
-target_link_libraries(test_conf sshclient otherbackends settings network crypto utils ${platform_libraries})
+be_list(test_conf TestConf SSH)
+target_link_libraries(test_conf sshclient settings network crypto utils ${platform_libraries})
 
 foreach(subdir ${platform} ${extra_dirs})
   add_subdirectory(${subdir})
 endforeach()
 
-# Nasty bodge: we'd like to run this command inside unix/CMakeLists,
-# adding the 'charset' library to everything that links with utils.
-# But that wasn't allowed until cmake 3.13 (see cmake policy CMP0073),
-# and we still have a min cmake version less than that. So we do it
-# here instead.
 if(platform STREQUAL unix)
   target_link_libraries(utils charset)
 endif()

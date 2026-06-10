@@ -318,6 +318,12 @@ const char *winsock_error_string(int error);
 Socket *sk_newlistener_unix(const char *socketpath, Plug *plug);
 
 /*
+ * Exports from wsnet.c - WebSocket transport
+ */
+Socket *ws_new_connection(const char *hostname, int port,
+                          Plug *plug, Conf *conf);
+
+/*
  * network.c dynamically loads WinSock 2 or WinSock 1 depending on
  * what it can get, which means any WinSock routines used outside
  * that module must be exported from it as function pointers. So

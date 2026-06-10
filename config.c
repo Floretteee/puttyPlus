@@ -2249,43 +2249,27 @@ void setup_config_box(struct controlbox *b, bool midsession,
                   I(CONF_erase_to_scrollback));
 
     /*
-     * The Window/Appearance panel.
+     * The Connection/WebSocket panel - replaces Window/Appearance.
      */
-    str = dupprintf("Configure the appearance of %s's window", appname);
-    ctrl_settitle(b, "Window/Appearance", str);
-    sfree(str);
+    ctrl_settitle(b, "Connection/WebSocket", "Options for WebSocket proxy");
 
-    s = ctrl_getset(b, "Window/Appearance", "cursor",
-                    "Adjust the use of the cursor");
-    ctrl_radiobuttons(s, "Cursor appearance:", NO_SHORTCUT, 3,
-                      HELPCTX(appearance_cursor),
-                      conf_radiobutton_handler,
-                      I(CONF_cursor_type),
-                      "Block", 'l', I(CURSOR_BLOCK),
-                      "Underline", 'u', I(CURSOR_UNDERLINE),
-                      "Vertical line", 'v', I(CURSOR_VERTICAL_LINE));
-    ctrl_checkbox(s, "Cursor blinks", 'b',
-                  HELPCTX(appearance_cursor),
-                  conf_checkbox_handler, I(CONF_blink_cur));
-
-    s = ctrl_getset(b, "Window/Appearance", "font",
-                    "Font settings");
-    ctrl_fontsel(s, "Font used in the terminal window", 'n',
-                 HELPCTX(appearance_font),
-                 conf_fontsel_handler, I(CONF_font));
-
-    s = ctrl_getset(b, "Window/Appearance", "mouse",
-                    "Adjust the use of the mouse pointer");
-    ctrl_checkbox(s, "Hide mouse pointer when typing in window", 'p',
-                  HELPCTX(appearance_hidemouse),
-                  conf_checkbox_handler, I(CONF_hide_mouseptr));
-
-    s = ctrl_getset(b, "Window/Appearance", "border",
-                    "Adjust the window border");
-    ctrl_editbox(s, "Gap between text and window edge:", 'e', 20,
-                 HELPCTX(appearance_border),
-                 conf_editbox_handler,
-                 I(CONF_window_border), ED_INT);
+    s = ctrl_getset(b, "Connection/WebSocket", "proxy",
+                    "Configure the WebSocket proxy connection");
+    ctrl_checkbox(s, "Enable WebSocket proxy (bypass SSH blocking)", 'e',
+                  HELPCTX(no_help),
+                  conf_checkbox_handler, I(CONF_ws_proxy_enable));
+    ctrl_editbox(s, "WebSocket proxy host:", 'h', 100,
+                 HELPCTX(no_help),
+                 conf_editbox_handler, I(CONF_ws_proxy_host), I(0));
+    ctrl_editbox(s, "WebSocket proxy port:", 'p', 20,
+                 HELPCTX(no_help),
+                 conf_editbox_handler, I(CONF_ws_proxy_port), I(0));
+    ctrl_editbox(s, "WebSocket path:", 'w', 100,
+                 HELPCTX(no_help),
+                 conf_editbox_handler, I(CONF_ws_proxy_path), I(0));
+    ctrl_checkbox(s, "Use TLS (WSS)", 't',
+                  HELPCTX(no_help),
+                  conf_checkbox_handler, I(CONF_ws_proxy_tls));
 
     /*
      * The Window/Behaviour panel.

@@ -157,6 +157,33 @@ CONF_OPTION(proxy_log_to_term,
     STORAGE_ENUM(on_off_auto),
 )
 
+/* WebSocket proxy options */
+CONF_OPTION(ws_proxy_enable,
+    VALUE_TYPE(BOOL),
+    DEFAULT_BOOL(true),
+    SAVE_KEYWORD("WSProxyEnable"),
+)
+CONF_OPTION(ws_proxy_host,
+    VALUE_TYPE(STR),
+    DEFAULT_STR("ssheasy.com"),
+    SAVE_KEYWORD("WSProxyHost"),
+)
+CONF_OPTION(ws_proxy_port,
+    VALUE_TYPE(INT),
+    DEFAULT_INT(443),
+    SAVE_KEYWORD("WSProxyPort"),
+)
+CONF_OPTION(ws_proxy_tls,
+    VALUE_TYPE(BOOL),
+    DEFAULT_BOOL(true),
+    SAVE_KEYWORD("WSProxyTLS"),
+)
+CONF_OPTION(ws_proxy_path,
+    VALUE_TYPE(STR),
+    DEFAULT_STR("/p"),
+    SAVE_KEYWORD("WSProxyPath"),
+)
+
 /* SSH options */
 CONF_OPTION(remote_cmd,
     VALUE_TYPE(STR_AMBI),

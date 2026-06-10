@@ -58,17 +58,12 @@ add_sources_from_current_dir(sshclient
   agent-client.c gss.c sharing.c)
 add_sources_from_current_dir(sftpclient
   sftp.c)
-add_sources_from_current_dir(otherbackends
-  serial.c)
 add_sources_from_current_dir(agent
   agent-client.c)
 add_sources_from_current_dir(guiterminal
   dialog.c controls.c config.c printing.c jump-list.c sizetip.c)
-add_dependencies(guiterminal generated_licence_h) # dialog.c uses licence.h
+add_dependencies(guiterminal generated_licence_h)
 
-# This object awkwardly needs to live in the network library as well
-# as the eventloop library, in case it didn't get pulled in from the
-# latter before handle-socket.c needed it.
 add_library(handle-io OBJECT
   handle-io.c)
 target_sources(eventloop PRIVATE $<TARGET_OBJECTS:handle-io>)
@@ -97,42 +92,27 @@ add_dependencies(pscp generated_licence_h)
 add_sources_from_current_dir(psftp no-jump-list.c nohelp.c psftp.rc)
 add_dependencies(psftp generated_licence_h)
 
-add_sources_from_current_dir(psocks nohelp.c)
-
-add_executable(putty
+# PuTTYPlus - main GUI application with WebSocket transport
+add_executable(puttyplus
   window.c
   putty.c
+  wsnet.c
+  conpty.c
   help.c
   ${CMAKE_SOURCE_DIR}/stubs/no-console.c
   putty.rc)
-be_list(putty PuTTY SSH SERIAL OTHERBACKENDS)
-add_dependencies(putty generated_licence_h)
-target_link_libraries(putty
-  guiterminal guimisc eventloop sshclient otherbackends settings network crypto
+be_list(puttyplus PuTTYPlus SSH)
+add_dependencies(puttyplus generated_licence_h)
+target_link_libraries(puttyplus
+  guiterminal guimisc eventloop sshclient settings network crypto
   utils
   ${platform_libraries})
-set_target_properties(putty PROPERTIES WIN32_EXECUTABLE ON)
-installed_program(putty)
+set_target_properties(puttyplus PROPERTIES WIN32_EXECUTABLE ON)
+installed_program(puttyplus)
 
-add_executable(puttytel
-  window.c
-  putty.c
-  help.c
-  ${CMAKE_SOURCE_DIR}/stubs/no-gss.c
-  ${CMAKE_SOURCE_DIR}/stubs/no-ca-config.c
-  ${CMAKE_SOURCE_DIR}/stubs/no-console.c
-  ${CMAKE_SOURCE_DIR}/stubs/no-rand.c
-  ${CMAKE_SOURCE_DIR}/stubs/no-dit.c
-  ${CMAKE_SOURCE_DIR}/proxy/nocproxy.c
-  ${CMAKE_SOURCE_DIR}/proxy/nosshproxy.c
-  puttytel.rc)
-be_list(puttytel PuTTYtel SERIAL OTHERBACKENDS)
-add_dependencies(puttytel generated_licence_h)
-target_link_libraries(puttytel
-  guiterminal guimisc eventloop otherbackends settings network utils
-  ${platform_libraries})
-set_target_properties(puttytel PROPERTIES WIN32_EXECUTABLE ON)
-installed_program(puttytel)
+add_sources_from_current_dir(plink wsnet.c)
+
+target_sources(puttyplus PRIVATE ${CMAKE_SOURCE_DIR}/otherbackends/testback.c)
 
 add_executable(puttygen
   puttygen.c

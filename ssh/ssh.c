@@ -824,22 +824,30 @@ static char *connect_to_host(
          * We're not a downstream, so open a normal socket.
          */
 
-        /*
-         * Try to find host.
-         */
-        addressfamily = conf_get_int(ssh->conf, CONF_addressfamily);
-        addr = name_lookup(host, port, realhost, ssh->conf, addressfamily,
-                           ssh->logctx, "SSH connection");
-        if ((err = sk_addr_error(addr)) != NULL) {
-            sk_addr_free(addr);
-            return dupstr(err);
-        }
-        ssh->fullhostname = dupstr(*realhost);   /* save in case of GSSAPI */
+        if (conf_get_bool(ssh->conf, CONF_ws_proxy_enable)) {
+            *realhost = dupstr(host);
+            ssh->fullhostname = dupstr(*realhost);
+            ssh->s = ws_new_connection(
+                *realhost, port,
+                &ssh->plug, ssh->conf);
+        } else {
+            /*
+             * Try to find host.
+             */
+            addressfamily = conf_get_int(ssh->conf, CONF_addressfamily);
+            addr = name_lookup(host, port, realhost, ssh->conf, addressfamily,
+                               ssh->logctx, "SSH connection");
+            if ((err = sk_addr_error(addr)) != NULL) {
+                sk_addr_free(addr);
+                return dupstr(err);
+            }
+            ssh->fullhostname = dupstr(*realhost);
 
-        ssh->s = new_main_connection(
-            addr, *realhost, port, false, true, nodelay, keepalive,
-            &ssh->plug, ssh->conf, &ssh->interactor, ssh->logctx);
-        if ((err = sk_socket_error(ssh->s)) != NULL) {
+            ssh->s = new_main_connection(
+                addr, *realhost, port, false, true, nodelay, keepalive,
+                &ssh->plug, ssh->conf, &ssh->interactor, ssh->logctx);
+        }
+        if (!ssh->s || (err = sk_socket_error(ssh->s)) != NULL) {
             char *toret = dupstr(err);
             sk_close(ssh->s);
             ssh->s = NULL;
