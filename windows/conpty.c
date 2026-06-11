@@ -340,6 +340,8 @@ static size_t conpty_sendbuffer(Backend *be)
 static void conpty_size(Backend *be, int width, int height)
 {
     ConPTY *conpty = container_of(be, ConPTY, backend);
+    if (conpty->pseudoconsole == INVALID_HANDLE_VALUE)
+        return;
     COORD size;
     size.X = width;
     size.Y = height;

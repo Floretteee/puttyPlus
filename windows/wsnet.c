@@ -2,15 +2,33 @@
 #define _WIN32_WINNT 0x0602
 #endif
 
+#define SECURITY_WIN32
+
 #include <winsock2.h>
 #include <windows.h>
 #include <ws2tcpip.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <bcrypt.h>
+#include <security.h>
+#include <schnlsp.h>
 
 #include "putty.h"
 #include "network.h"
+
+#define WS_MAGIC_GUID "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+struct TLSState {
+    CredHandle hCred;
+    bool cred_init;
+    CtxtHandle hCtx;
+    bool ctx_init;
+    SecPkgContext_StreamSizes sizes;
+    bool active;
+    unsigned char extra[16384];
+    int extra_len;
+};
 
 struct WSSocket {
     const struct SocketVtable *vt;
@@ -26,10 +44,11 @@ struct WSSocket {
 
     SOCKET s;
     HANDLE thread;
+    HANDLE thread_exit;
     CRITICAL_SECTION lock;
 
     bufchain send_queue;
-    bool closing;
+    volatile long closing;
     bool closed;
 
     bufchain recv_queue;
@@ -45,11 +64,433 @@ struct WSSocket {
     bool connect_queued;
 
     bool frozen;
+
+    struct TLSState tls;
+
+    char local_addr[64];
+    int local_port;
+    char remote_addr[64];
+    int remote_port;
 };
 
 static void wsnet_recv_idempotent(void *ctx);
 static void wsnet_error_idempotent(void *ctx);
 static void wsnet_connect_idempotent(void *ctx);
+
+static int send_all(SOCKET s, const void *data, size_t len)
+{
+    const char *p = (const char *)data;
+    size_t remaining = len;
+    while (remaining > 0) {
+        int sent = send(s, p, (int)remaining, 0);
+        if (sent == SOCKET_ERROR) return SOCKET_ERROR;
+        p += sent;
+        remaining -= sent;
+    }
+    return (int)len;
+}
+
+/* --- TLS (SChannel) --- */
+
+static void tls_cleanup(struct TLSState *tls)
+{
+    tls->active = false;
+    tls->extra_len = 0;
+    if (tls->ctx_init) {
+        DeleteSecurityContext(&tls->hCtx);
+        tls->ctx_init = false;
+    }
+    if (tls->cred_init) {
+        FreeCredentialsHandle(&tls->hCred);
+        tls->cred_init = false;
+    }
+}
+
+static bool tls_handshake(struct WSSocket *ws)
+{
+    struct TLSState *tls = &ws->tls;
+    SCHANNEL_CRED sc = {0};
+    sc.dwVersion = SCHANNEL_CRED_VERSION;
+    sc.dwFlags = SCH_CRED_MANUAL_CRED_VALIDATION | SCH_CRED_NO_DEFAULT_CREDS;
+    sc.grbitEnabledProtocols = SP_PROT_TLS1_2_SERVER;
+    TimeStamp expiry;
+
+    SECURITY_STATUS ret = AcquireCredentialsHandle(
+        NULL, UNISP_NAME, SECPKG_CRED_OUTBOUND,
+        NULL, &sc, NULL, NULL, &tls->hCred, &expiry);
+    if (ret != SEC_E_OK) return false;
+    tls->cred_init = true;
+
+    bool first_pass = true;
+    ULONG attr;
+    unsigned char recv_buf[16384];
+    int recv_len = 0;
+
+    ret = SEC_I_CONTINUE_NEEDED;
+    while (ret == SEC_I_CONTINUE_NEEDED || ret == SEC_E_INCOMPLETE_MESSAGE) {
+        if (ret == SEC_E_INCOMPLETE_MESSAGE) {
+            int n = recv(ws->s, (char *)recv_buf + recv_len,
+                         (int)sizeof(recv_buf) - recv_len, 0);
+            if (n <= 0) { tls_cleanup(tls); return false; }
+            recv_len += n;
+        }
+
+        SecBuffer outBufs[1];
+        outBufs[0].BufferType = SECBUFFER_TOKEN;
+        outBufs[0].cbBuffer = 0;
+        outBufs[0].pvBuffer = NULL;
+        SecBufferDesc outDesc;
+        outDesc.ulVersion = SECBUFFER_VERSION;
+        outDesc.cBuffers = 1;
+        outDesc.pBuffers = outBufs;
+
+        SecBuffer inBufs[2];
+        inBufs[0].BufferType = SECBUFFER_TOKEN;
+        inBufs[0].pvBuffer = recv_buf;
+        inBufs[0].cbBuffer = recv_len;
+        inBufs[1].BufferType = SECBUFFER_EMPTY;
+        SecBufferDesc inDesc;
+        inDesc.ulVersion = SECBUFFER_VERSION;
+        inDesc.cBuffers = 2;
+        inDesc.pBuffers = inBufs;
+
+        ret = InitializeSecurityContext(
+            &tls->hCred,
+            first_pass ? NULL : &tls->hCtx,
+            NULL,
+            ISC_REQ_CONFIDENTIALITY | ISC_REQ_REPLAY_DETECT |
+            ISC_REQ_SEQUENCE_DETECT | ISC_REQ_STREAM,
+            0, 0,
+            first_pass ? NULL : &inDesc,
+            0,
+            first_pass ? &tls->hCtx : NULL,
+            &outDesc, &attr, &expiry);
+        first_pass = false;
+        if (ret == SEC_E_OK || ret == SEC_I_CONTINUE_NEEDED ||
+            ret == SEC_E_INCOMPLETE_MESSAGE)
+            tls->ctx_init = true;
+
+        if (ret == SEC_E_OK || ret == SEC_I_CONTINUE_NEEDED) {
+            if (outBufs[0].cbBuffer > 0 && outBufs[0].pvBuffer) {
+                if (send_all(ws->s, outBufs[0].pvBuffer,
+                             outBufs[0].cbBuffer) == SOCKET_ERROR) {
+                    FreeContextBuffer(outBufs[0].pvBuffer);
+                    tls_cleanup(tls);
+                    return false;
+                }
+                FreeContextBuffer(outBufs[0].pvBuffer);
+            }
+
+            if (inBufs[1].BufferType == SECBUFFER_EXTRA && inBufs[1].cbBuffer > 0) {
+                memmove(recv_buf,
+                        (unsigned char *)inBufs[1].pvBuffer, inBufs[1].cbBuffer);
+                recv_len = inBufs[1].cbBuffer;
+            } else {
+                recv_len = 0;
+            }
+
+            if (ret == SEC_I_CONTINUE_NEEDED && recv_len == 0) {
+                int n = recv(ws->s, (char *)recv_buf, (int)sizeof(recv_buf), 0);
+                if (n <= 0) { tls_cleanup(tls); return false; }
+                recv_len = n;
+            }
+        }
+    }
+
+    if (ret != SEC_E_OK) { tls_cleanup(tls); return false; }
+
+    ret = QueryContextAttributes(
+        &tls->hCtx, SECPKG_ATTR_STREAM_SIZES, &tls->sizes);
+    if (ret != SEC_E_OK) { tls_cleanup(tls); return false; }
+
+    tls->active = true;
+    return true;
+}
+
+static int tls_encrypt_send(struct WSSocket *ws,
+                            const unsigned char *data, size_t len)
+{
+    struct TLSState *tls = &ws->tls;
+    if (!tls->active) return send_all(ws->s, data, len);
+
+    size_t msgSize = tls->sizes.cbHeader + len + tls->sizes.cbTrailer;
+    unsigned char *msg = (unsigned char *)malloc(msgSize);
+    if (!msg) return SOCKET_ERROR;
+
+    SecBuffer bufs[4];
+    bufs[0].BufferType = SECBUFFER_STREAM_HEADER;
+    bufs[0].cbBuffer = tls->sizes.cbHeader;
+    bufs[0].pvBuffer = msg;
+    bufs[1].BufferType = SECBUFFER_DATA;
+    bufs[1].cbBuffer = (unsigned long)len;
+    bufs[1].pvBuffer = msg + tls->sizes.cbHeader;
+    memcpy(bufs[1].pvBuffer, data, len);
+    bufs[2].BufferType = SECBUFFER_STREAM_TRAILER;
+    bufs[2].cbBuffer = tls->sizes.cbTrailer;
+    bufs[2].pvBuffer = msg + tls->sizes.cbHeader + len;
+    bufs[3].BufferType = SECBUFFER_EMPTY;
+
+    SecBufferDesc desc;
+    desc.ulVersion = SECBUFFER_VERSION;
+    desc.cBuffers = 4;
+    desc.pBuffers = bufs;
+
+    SECURITY_STATUS ret = EncryptMessage(&tls->hCtx, 0, &desc, 0);
+    if (ret != SEC_E_OK) { free(msg); return SOCKET_ERROR; }
+
+    size_t total = (size_t)bufs[0].cbBuffer +
+                   (size_t)bufs[1].cbBuffer +
+                   (size_t)bufs[2].cbBuffer;
+    int result = send_all(ws->s, msg, total);
+    free(msg);
+    return result;
+}
+
+static int tls_decrypt_recv(struct WSSocket *ws,
+                            unsigned char *buf, size_t bufSize)
+{
+    struct TLSState *tls = &ws->tls;
+    if (!tls->active) {
+        return recv(ws->s, (char *)buf, (int)bufSize, 0);
+    }
+
+    int raw_len;
+    if (tls->extra_len > 0) {
+        memcpy(buf, tls->extra, (size_t)tls->extra_len);
+        raw_len = tls->extra_len;
+        tls->extra_len = 0;
+        int n = recv(ws->s, (char *)buf + raw_len,
+                     (int)(bufSize - (size_t)raw_len), 0);
+        if (n <= 0) return (raw_len > 0) ? raw_len : n;
+        raw_len += n;
+    } else {
+        int n = recv(ws->s, (char *)buf, (int)bufSize, 0);
+        if (n <= 0) return n;
+        raw_len = n;
+    }
+
+    SecBuffer bufs[4];
+    bufs[0].BufferType = SECBUFFER_DATA;
+    bufs[0].cbBuffer = raw_len;
+    bufs[0].pvBuffer = buf;
+    bufs[1].BufferType = SECBUFFER_EMPTY;
+    bufs[2].BufferType = SECBUFFER_EMPTY;
+    bufs[3].BufferType = SECBUFFER_EMPTY;
+
+    SecBufferDesc desc;
+    desc.ulVersion = SECBUFFER_VERSION;
+    desc.cBuffers = 4;
+    desc.pBuffers = bufs;
+
+    SECURITY_STATUS ret = DecryptMessage(&tls->hCtx, &desc, 0, NULL);
+    if (ret == SEC_E_INCOMPLETE_MESSAGE) return 0;
+    if (ret != SEC_E_OK) return -1;
+
+    for (int i = 0; i < 4; i++) {
+        if (bufs[i].BufferType == SECBUFFER_DATA) {
+            int dlen = bufs[i].cbBuffer;
+            if ((size_t)dlen > bufSize) dlen = (int)bufSize;
+            memmove(buf, bufs[i].pvBuffer, (size_t)dlen);
+
+            for (int j = 0; j < 4; j++) {
+                if (bufs[j].BufferType == SECBUFFER_EXTRA &&
+                    bufs[j].cbBuffer > 0) {
+                    size_t remain = (size_t)bufs[j].cbBuffer;
+                    if (remain > sizeof(tls->extra))
+                        remain = sizeof(tls->extra);
+                    memcpy(tls->extra, bufs[j].pvBuffer, remain);
+                    tls->extra_len = (int)remain;
+                }
+            }
+            return dlen;
+        }
+    }
+    return -1;
+}
+
+/* --- WebSocket frame helpers --- */
+
+static void wsnet_generate_random(void *buf, size_t len)
+{
+    BCryptGenRandom(NULL, (PUCHAR)buf, (ULONG)len,
+                    BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+}
+
+static int wsnet_send_frame(struct WSSocket *ws,
+                            const unsigned char *data, size_t len, int opcode)
+{
+    unsigned char header[14];
+    size_t hdr_len = 0;
+
+    header[hdr_len++] = (unsigned char)(0x80 | opcode);
+
+    unsigned char mask[4];
+    wsnet_generate_random(mask, 4);
+
+    if (len < 126) {
+        header[hdr_len++] = (unsigned char)(0x80 | len);
+    } else if (len < 65536) {
+        header[hdr_len++] = (unsigned char)(0x80 | 126);
+        header[hdr_len++] = (unsigned char)((len >> 8) & 0xFF);
+        header[hdr_len++] = (unsigned char)(len & 0xFF);
+    } else {
+        header[hdr_len++] = (unsigned char)(0x80 | 127);
+        uint64_t n = len;
+        for (int i = 7; i >= 0; i--)
+            header[hdr_len++] = (unsigned char)((n >> (i * 8)) & 0xFF);
+    }
+
+    for (int i = 0; i < 4; i++)
+        header[hdr_len++] = mask[i];
+
+    if (tls_encrypt_send(ws, header, hdr_len) == SOCKET_ERROR)
+        return SOCKET_ERROR;
+
+    unsigned char *masked = (unsigned char *)malloc(len);
+    if (!masked) return SOCKET_ERROR;
+    for (size_t i = 0; i < len; i++)
+        masked[i] = (unsigned char)(data[i] ^ mask[i & 3]);
+    int ret = tls_encrypt_send(ws, masked, len);
+    free(masked);
+    return ret;
+}
+
+static void wsnet_generate_key(char *key_b64)
+{
+    unsigned char key_bytes[16];
+    wsnet_generate_random(key_bytes, 16);
+
+    static const char b64[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    int val = 0, bits = 0, out = 0;
+    for (int i = 0; i < 16; i++) {
+        val = (val << 8) | key_bytes[i];
+        bits += 8;
+        while (bits >= 6) {
+            bits -= 6;
+            key_b64[out++] = b64[(val >> bits) & 0x3F];
+        }
+    }
+    if (bits > 0)
+        key_b64[out++] = b64[(val << (6 - bits)) & 0x3F];
+    while (out % 4)
+        key_b64[out++] = '=';
+    key_b64[out] = '\0';
+}
+
+/* RFC 6455 Sec-WebSocket-Accept validation */
+static bool validate_accept(const char *accept, const char *key)
+{
+    char concat[128];
+    size_t klen = strlen(key);
+    if (klen + sizeof(WS_MAGIC_GUID) > sizeof(concat)) return false;
+    memcpy(concat, key, klen);
+    memcpy(concat + klen, WS_MAGIC_GUID, sizeof(WS_MAGIC_GUID));
+
+    unsigned char sha1[20];
+    BCRYPT_ALG_HANDLE hAlg = NULL;
+    if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA1_ALGORITHM,
+                                    NULL, 0) != 0)
+        return false;
+    BCRYPT_HASH_HANDLE hHash = NULL;
+    if (BCryptCreateHash(hAlg, &hHash, NULL, 0, NULL, 0, 0) != 0) {
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return false;
+    }
+    ULONG result = BCryptHashData(hHash, (PUCHAR)concat,
+        (ULONG)(klen + sizeof(WS_MAGIC_GUID) - 1), 0);
+    if (result != 0) {
+        BCryptDestroyHash(hHash);
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return false;
+    }
+    BCryptFinishHash(hHash, sha1, 20, 0);
+    BCryptDestroyHash(hHash);
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+
+    char expected_b64[32];
+    static const char b64[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    int val = 0, bits = 0, out = 0;
+    for (int i = 0; i < 20; i++) {
+        val = (val << 8) | sha1[i];
+        bits += 8;
+        while (bits >= 6) {
+            bits -= 6;
+            expected_b64[out++] = b64[(val >> bits) & 0x3F];
+        }
+    }
+    if (bits > 0)
+        expected_b64[out++] = b64[(val << (6 - bits)) & 0x3F];
+    while (out % 4)
+        expected_b64[out++] = '=';
+    expected_b64[out] = '\0';
+
+    return strcmp(accept, expected_b64) == 0;
+}
+
+/* Structured JSON check for {"status":"ok"} */
+static bool check_json_ok(const char *json)
+{
+    const char *p = json;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (*p++ != '{') return false;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (strncmp(p, "\"status\"", 8) != 0) return false;
+    p += 8;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p++ != ':') return false;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p++ != '"') return false;
+    if (strncmp(p, "ok", 2) != 0) return false;
+    p += 2;
+    if (*p++ != '"') return false;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (*p++ != '}') return false;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    return *p == '\0';
+}
+
+static void populate_endpoint_info(SOCKET s, struct WSSocket *ws)
+{
+    struct sockaddr_storage addr;
+    int addrlen = sizeof(addr);
+
+    if (getsockname(s, (struct sockaddr *)&addr, &addrlen) == 0) {
+        if (addr.ss_family == AF_INET) {
+            struct sockaddr_in *sin = (struct sockaddr_in *)&addr;
+            ws->local_port = ntohs(sin->sin_port);
+            getnameinfo((struct sockaddr *)sin, sizeof(*sin),
+                        ws->local_addr, sizeof(ws->local_addr),
+                        NULL, 0, NI_NUMERICHOST);
+        } else if (addr.ss_family == AF_INET6) {
+            struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&addr;
+            ws->local_port = ntohs(sin6->sin6_port);
+            getnameinfo((struct sockaddr *)sin6, sizeof(*sin6),
+                        ws->local_addr, sizeof(ws->local_addr),
+                        NULL, 0, NI_NUMERICHOST);
+        }
+    }
+
+    addrlen = sizeof(addr);
+    if (getpeername(s, (struct sockaddr *)&addr, &addrlen) == 0) {
+        if (addr.ss_family == AF_INET) {
+            struct sockaddr_in *sin = (struct sockaddr_in *)&addr;
+            ws->remote_port = ntohs(sin->sin_port);
+            getnameinfo((struct sockaddr *)sin, sizeof(*sin),
+                        ws->remote_addr, sizeof(ws->remote_addr),
+                        NULL, 0, NI_NUMERICHOST);
+        } else if (addr.ss_family == AF_INET6) {
+            struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&addr;
+            ws->remote_port = ntohs(sin6->sin6_port);
+            getnameinfo((struct sockaddr *)sin6, sizeof(*sin6),
+                        ws->remote_addr, sizeof(ws->remote_addr),
+                        NULL, 0, NI_NUMERICHOST);
+        }
+    }
+}
+
+/* --- Socket callbacks --- */
 
 static const char *wsnet_socket_error(Socket *s)
 {
@@ -87,67 +528,6 @@ static void wsnet_queue_connect(struct WSSocket *ws)
         ws->connect_queued = true;
         queue_idempotent_callback(&ws->connect_ic);
     }
-}
-
-static void wsnet_send_websocket_frame(SOCKET s, const unsigned char *data,
-                                        size_t len, int opcode)
-{
-    unsigned char header[14];
-    size_t hdr_len = 0;
-
-    header[hdr_len++] = 0x80 | opcode;
-
-    unsigned char mask[4];
-    for (int i = 0; i < 4; i++)
-        mask[i] = (rand() & 0xFF);
-
-    if (len < 126) {
-        header[hdr_len++] = 0x80 | (unsigned char)len;
-    } else if (len < 65536) {
-        header[hdr_len++] = 0x80 | 126;
-        header[hdr_len++] = (len >> 8) & 0xFF;
-        header[hdr_len++] = len & 0xFF;
-    } else {
-        header[hdr_len++] = 0x80 | 127;
-        uint64_t n = len;
-        for (int i = 7; i >= 0; i--)
-            header[hdr_len++] = (n >> (i * 8)) & 0xFF;
-    }
-
-    for (int i = 0; i < 4; i++)
-        header[hdr_len++] = mask[i];
-
-    send(s, (const char *)header, hdr_len, 0);
-
-    unsigned char *masked = (unsigned char *)malloc(len);
-    for (size_t i = 0; i < len; i++)
-        masked[i] = data[i] ^ mask[i & 3];
-    send(s, (const char *)masked, len, 0);
-    free(masked);
-}
-
-static void wsnet_generate_key(char *key_b64)
-{
-    unsigned char key_bytes[16];
-    for (int i = 0; i < 16; i++)
-        key_bytes[i] = rand() & 0xFF;
-
-    static const char b64[] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    int val = 0, bits = 0, out = 0;
-    for (int i = 0; i < 16; i++) {
-        val = (val << 8) | key_bytes[i];
-        bits += 8;
-        while (bits >= 6) {
-            bits -= 6;
-            key_b64[out++] = b64[(val >> bits) & 0x3F];
-        }
-    }
-    if (bits > 0)
-        key_b64[out++] = b64[(val << (6 - bits)) & 0x3F];
-    while (out % 4)
-        key_b64[out++] = '=';
-    key_b64[out] = '\0';
 }
 
 static DWORD WINAPI wsnet_thread(LPVOID param)
@@ -209,6 +589,18 @@ static DWORD WINAPI wsnet_thread(LPVOID param)
 
     freeaddrinfo(ai);
 
+    populate_endpoint_info(ws->s, ws);
+
+    if (ws->use_tls) {
+        if (!tls_handshake(ws)) {
+            ws->pending_error = "WebSocket: TLS handshake failed";
+            closesocket(ws->s);
+            ws->s = INVALID_SOCKET;
+            wsnet_queue_error(ws);
+            return 1;
+        }
+    }
+
     char key_b64[64];
     wsnet_generate_key(key_b64);
 
@@ -225,8 +617,9 @@ static DWORD WINAPI wsnet_thread(LPVOID param)
         "\r\n",
         path, ws->proxy_host, ws->proxy_port, key_b64);
 
-    if (send(ws->s, handshake, hlen, 0) != hlen) {
+    if (tls_encrypt_send(ws, (const unsigned char *)handshake, hlen) != hlen) {
         ws->pending_error = "WebSocket: handshake send failed";
+        tls_cleanup(&ws->tls);
         closesocket(ws->s);
         ws->s = INVALID_SOCKET;
         wsnet_queue_error(ws);
@@ -237,9 +630,11 @@ static DWORD WINAPI wsnet_thread(LPVOID param)
     int total = 0;
     bool got_headers = false;
     while (!got_headers) {
-        int ret = recv(ws->s, resp + total, sizeof(resp) - 1 - total, 0);
+        int ret = tls_decrypt_recv(ws, (unsigned char *)resp + total,
+                                   sizeof(resp) - 1 - total);
         if (ret <= 0) {
             ws->pending_error = "WebSocket: handshake failed";
+            tls_cleanup(&ws->tls);
             closesocket(ws->s);
             ws->s = INVALID_SOCKET;
             wsnet_queue_error(ws);
@@ -247,15 +642,33 @@ static DWORD WINAPI wsnet_thread(LPVOID param)
         }
         total += ret;
         resp[total] = '\0';
-
-        if (strstr(resp, "\r\n\r\n")) {
-            got_headers = true;
-        }
+        if (strstr(resp, "\r\n\r\n")) got_headers = true;
     }
 
     int status;
+    char accept_hdr[128] = "";
+    char *accept_ptr = strstr(resp, "Sec-WebSocket-Accept: ");
+    if (accept_ptr) {
+        accept_ptr += 22;
+        int alen = 0;
+        while (accept_ptr[alen] && accept_ptr[alen] != '\r' && alen < 120)
+            alen++;
+        memcpy(accept_hdr, accept_ptr, alen);
+        accept_hdr[alen] = '\0';
+    }
+
     if (sscanf(resp, "HTTP/1.1 %d", &status) != 1 || status != 101) {
         ws->pending_error = "WebSocket: server rejected upgrade";
+        tls_cleanup(&ws->tls);
+        closesocket(ws->s);
+        ws->s = INVALID_SOCKET;
+        wsnet_queue_error(ws);
+        return 1;
+    }
+
+    if (accept_hdr[0] && !validate_accept(accept_hdr, key_b64)) {
+        ws->pending_error = "WebSocket: invalid Sec-WebSocket-Accept";
+        tls_cleanup(&ws->tls);
         closesocket(ws->s);
         ws->s = INVALID_SOCKET;
         wsnet_queue_error(ws);
@@ -269,21 +682,28 @@ static DWORD WINAPI wsnet_thread(LPVOID param)
     int init_len = sprintf(init_msg,
         "{\"host\":\"%s\",\"port\":%d}",
         ws->target_host, ws->target_port);
-    wsnet_send_websocket_frame(ws->s,
-        (const unsigned char *)init_msg, init_len, 0x1);
+    wsnet_send_frame(ws, (const unsigned char *)init_msg, init_len, 0x1);
 
-    unsigned char frame_buf[65536];
+    unsigned char *frame_buf = (unsigned char *)malloc(65536);
+    if (!frame_buf) {
+        ws->pending_error = "WebSocket: out of memory";
+        tls_cleanup(&ws->tls);
+        closesocket(ws->s);
+        ws->s = INVALID_SOCKET;
+        wsnet_queue_error(ws);
+        return 1;
+    }
     size_t frame_pos = 0;
     bool expecting_json = true;
     int json_len = 0;
     char json_buf[4096];
 
-    while (!ws->closing) {
+    while (!InterlockedExchangeAdd(&ws->closing, 0)) {
         EnterCriticalSection(&ws->lock);
         size_t send_len = bufchain_size(&ws->send_queue);
         if (send_len > 0) {
             ptrlen data = bufchain_prefix(&ws->send_queue);
-            wsnet_send_websocket_frame(ws->s,
+            wsnet_send_frame(ws,
                 (const unsigned char *)data.ptr, data.len, 0x2);
             bufchain_consume(&ws->send_queue, data.len);
         }
@@ -297,17 +717,28 @@ static DWORD WINAPI wsnet_thread(LPVOID param)
         int sel = select(0, &rfds, NULL, NULL, &tv);
 
         if (sel > 0 && FD_ISSET(ws->s, &rfds)) {
-            int ret = recv(ws->s, (char *)frame_buf + frame_pos,
-                           (int)(sizeof(frame_buf) - frame_pos), 0);
+            int ret;
+            if (ws->use_tls) {
+                unsigned char tls_buf[65536];
+                ret = tls_decrypt_recv(ws, tls_buf, sizeof(tls_buf));
+                if (ret > 0) {
+                    if ((size_t)ret > 65536 - frame_pos)
+                        ret = (int)(65536 - frame_pos);
+                    memcpy(frame_buf + frame_pos, tls_buf, (size_t)ret);
+                    frame_pos += (size_t)ret;
+                }
+            } else {
+                ret = recv(ws->s, (char *)frame_buf + frame_pos,
+                           (int)(65536 - frame_pos), 0);
+                if (ret > 0) frame_pos += (size_t)ret;
+            }
             if (ret <= 0) {
                 ws->pending_error = "WebSocket: connection lost";
                 wsnet_queue_error(ws);
                 break;
             }
 
-            frame_pos += ret;
             size_t consumed = 0;
-
             while (consumed < frame_pos) {
                 if (frame_pos - consumed < 2) break;
 
@@ -319,7 +750,7 @@ static DWORD WINAPI wsnet_thread(LPVOID param)
 
                 if (payload_len == 126) {
                     if (frame_pos - consumed < 4) break;
-                    payload_len = (f[2] << 8) | f[3];
+                    payload_len = ((size_t)f[2] << 8) | f[3];
                     hdr = 4;
                 } else if (payload_len == 127) {
                     if (frame_pos - consumed < 10) break;
@@ -330,7 +761,7 @@ static DWORD WINAPI wsnet_thread(LPVOID param)
                 }
 
                 int mask_len = masked ? 4 : 0;
-                if (frame_pos - consumed < hdr + mask_len + payload_len)
+                if (frame_pos - consumed < hdr + (size_t)mask_len + payload_len)
                     break;
 
                 unsigned char *payload = f + hdr;
@@ -342,13 +773,13 @@ static DWORD WINAPI wsnet_thread(LPVOID param)
                 }
 
                 if (opcode == 0x8) {
-                    ws->closing = true;
+                    InterlockedExchange(&ws->closing, 1);
                     break;
                 }
 
                 if (opcode == 0x9) {
                     unsigned char pong[2] = {0x8A, 0x00};
-                    send(ws->s, (const char *)pong, 2, 0);
+                    tls_encrypt_send(ws, pong, 2);
                     consumed += hdr + payload_len;
                     continue;
                 }
@@ -380,9 +811,8 @@ static DWORD WINAPI wsnet_thread(LPVOID param)
             }
 
             if (json_len > 0) {
-                char *status_str = strstr(json_buf, "\"status\"");
-                char *ok_str = strstr(json_buf, "\"ok\"");
-                if (status_str && !ok_str) {
+                json_buf[json_len] = '\0';
+                if (!check_json_ok(json_buf)) {
                     ws->pending_error = "WebSocket: proxy rejected connection";
                     wsnet_queue_error(ws);
                     break;
@@ -392,6 +822,17 @@ static DWORD WINAPI wsnet_thread(LPVOID param)
             }
         }
     }
+
+    if (InterlockedExchangeAdd(&ws->closing, 0) && ws->connected) {
+        unsigned char close_frame[6] = {0x88, 0x80, 0, 0, 0, 0};
+        unsigned char mask[4];
+        wsnet_generate_random(mask, 4);
+        memcpy(close_frame + 2, mask, 4);
+        tls_encrypt_send(ws, close_frame, 6);
+    }
+
+    free(frame_buf);
+    tls_cleanup(&ws->tls);
 
     if (ws->s != INVALID_SOCKET) {
         closesocket(ws->s);
@@ -441,7 +882,9 @@ static void wsnet_connect_idempotent(void *ctx)
 static void wsnet_close(Socket *s)
 {
     struct WSSocket *ws = container_of(s, struct WSSocket, vt);
-    ws->closing = true;
+    InterlockedExchange(&ws->closing, 1);
+
+    if (ws->thread_exit) SetEvent(ws->thread_exit);
 
     if (ws->s != INVALID_SOCKET) {
         closesocket(ws->s);
@@ -449,9 +892,11 @@ static void wsnet_close(Socket *s)
     }
 
     if (ws->thread) {
-        WaitForSingleObject(ws->thread, 5000);
+        WaitForSingleObject(ws->thread, INFINITE);
         CloseHandle(ws->thread);
     }
+
+    if (ws->thread_exit) CloseHandle(ws->thread_exit);
 
     DeleteCriticalSection(&ws->lock);
     bufchain_clear(&ws->send_queue);
@@ -483,12 +928,8 @@ static size_t wsnet_write_oob(Socket *s, const void *data, size_t len)
 static void wsnet_write_eof(Socket *s)
 {
     struct WSSocket *ws = container_of(s, struct WSSocket, vt);
-    ws->closing = true;
-    if (ws->s != INVALID_SOCKET) {
-        unsigned char close_frame[2] = {0x88, 0x80};
-        unsigned char mask[4] = {0};
-        send(ws->s, (const char *)close_frame, 2, 0);
-    }
+    InterlockedExchange(&ws->closing, 1);
+    if (ws->thread_exit) SetEvent(ws->thread_exit);
 }
 
 static void wsnet_set_frozen(Socket *s, bool is_frozen)
@@ -499,7 +940,24 @@ static void wsnet_set_frozen(Socket *s, bool is_frozen)
 
 static SocketEndpointInfo *wsnet_endpoint_info(Socket *s, bool peer)
 {
-    return NULL;
+    struct WSSocket *ws = container_of(s, struct WSSocket, vt);
+    SocketEndpointInfo *ei = snew(SocketEndpointInfo);
+    memset(ei, 0, sizeof(*ei));
+
+    const char *addr = peer ? ws->remote_addr : ws->local_addr;
+    int port = peer ? ws->remote_port : ws->local_port;
+
+    if (addr[0]) {
+        ei->addr_text = dupstr(addr);
+        ei->port = port;
+        ei->log_text = dupprintf("%s:%d", addr, port);
+    } else {
+        ei->addr_text = NULL;
+        ei->port = -1;
+        ei->log_text = dupstr("WebSocket proxy");
+    }
+
+    return ei;
 }
 
 static const struct SocketVtable wsnet_sockvt = {
@@ -537,6 +995,8 @@ Socket *ws_new_connection(const char *hostname, int port,
     ws->connect_ic.fn = wsnet_connect_idempotent;
     ws->connect_ic.ctx = ws;
 
+    ws->thread_exit = CreateEvent(NULL, TRUE, FALSE, NULL);
+
     InitializeCriticalSection(&ws->lock);
     bufchain_init(&ws->send_queue);
     bufchain_init(&ws->recv_queue);
@@ -544,6 +1004,7 @@ Socket *ws_new_connection(const char *hostname, int port,
     DWORD tid;
     ws->thread = CreateThread(NULL, 0, wsnet_thread, ws, 0, &tid);
     if (!ws->thread) {
+        if (ws->thread_exit) CloseHandle(ws->thread_exit);
         sfree(ws->target_host);
         sfree(ws->proxy_host);
         sfree(ws->proxy_path);

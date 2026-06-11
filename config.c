@@ -2249,29 +2249,6 @@ void setup_config_box(struct controlbox *b, bool midsession,
                   I(CONF_erase_to_scrollback));
 
     /*
-     * The Connection/WebSocket panel - replaces Window/Appearance.
-     */
-    ctrl_settitle(b, "Connection/WebSocket", "Options for WebSocket proxy");
-
-    s = ctrl_getset(b, "Connection/WebSocket", "proxy",
-                    "Configure the WebSocket proxy connection");
-    ctrl_checkbox(s, "Enable WebSocket proxy (bypass SSH blocking)", 'e',
-                  HELPCTX(no_help),
-                  conf_checkbox_handler, I(CONF_ws_proxy_enable));
-    ctrl_editbox(s, "WebSocket proxy host:", 'h', 100,
-                 HELPCTX(no_help),
-                 conf_editbox_handler, I(CONF_ws_proxy_host), I(0));
-    ctrl_editbox(s, "WebSocket proxy port:", 'p', 20,
-                 HELPCTX(no_help),
-                 conf_editbox_handler, I(CONF_ws_proxy_port), I(0));
-    ctrl_editbox(s, "WebSocket path:", 'w', 100,
-                 HELPCTX(no_help),
-                 conf_editbox_handler, I(CONF_ws_proxy_path), I(0));
-    ctrl_checkbox(s, "Use TLS (WSS)", 't',
-                  HELPCTX(no_help),
-                  conf_checkbox_handler, I(CONF_ws_proxy_tls));
-
-    /*
      * The Window/Behaviour panel.
      */
     str = dupprintf("Configure the behaviour of %s's window", appname);
@@ -2503,6 +2480,29 @@ void setup_config_box(struct controlbox *b, bool midsession,
                          HELPCTX(connection_pre_hook),
                          conf_editbox_handler, I(CONF_pre_connect_command), ED_STR);
         }
+
+        /*
+         * The Connection/WebSocket panel.
+         */
+        ctrl_settitle(b, "Connection/WebSocket", "Options for WebSocket proxy");
+
+        s = ctrl_getset(b, "Connection/WebSocket", "proxy",
+                        "Configure the WebSocket proxy connection");
+        ctrl_checkbox(s, "Enable WebSocket proxy (bypass SSH blocking)", 'e',
+                      HELPCTX(no_help),
+                      conf_checkbox_handler, I(CONF_ws_proxy_enable));
+        ctrl_editbox(s, "WebSocket proxy host:", 'h', 100,
+                     HELPCTX(no_help),
+                     conf_editbox_handler, I(CONF_ws_proxy_host), I(0));
+        ctrl_editbox(s, "WebSocket proxy port:", 'p', 20,
+                     HELPCTX(no_help),
+                     conf_editbox_handler, I(CONF_ws_proxy_port), I(0));
+        ctrl_editbox(s, "WebSocket path:", 'w', 100,
+                     HELPCTX(no_help),
+                     conf_editbox_handler, I(CONF_ws_proxy_path), I(0));
+        ctrl_checkbox(s, "Use TLS (WSS)", 't',
+                      HELPCTX(no_help),
+                      conf_checkbox_handler, I(CONF_ws_proxy_tls));
 
         /*
          * A sub-panel Connection/Data, containing options that

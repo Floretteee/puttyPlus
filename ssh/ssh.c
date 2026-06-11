@@ -14,23 +14,80 @@
 /*
  * Check if a hostname is a local/private IP address.
  * Returns true for private IPv4 ranges (10.x.x.x, 172.16-31.x.x,
- * 192.168.x.x, 127.x.x.x) and IPv6 loopback (::1).
+ * 192.168.x.x, 127.x.x.x, 169.254.x.x, 0.x.x.x) and IPv6
+ * loopback (::1), ULA (fc00::/7), link-local (fe80::/10),
+ * and IPv4-mapped IPv6 addresses.
  * For hostnames (non-IP literals), returns false.
  */
 static bool is_local_host(const char *host)
 {
     unsigned int a, b, c, d;
     int n;
-    if (sscanf(host, "%u.%u.%u.%u%n", &a, &b, &c, &d, &n) == 4 &&
-        n == (int)strlen(host)) {
+
+    const char *h = host;
+    char stripped[64];
+
+    if (host[0] == '[') {
+        const char *end = strchr(host, ']');
+        if (!end) return false;
+        size_t len = end - host - 1;
+        if (len >= sizeof(stripped)) return false;
+        memcpy(stripped, host + 1, len);
+        stripped[len] = '\0';
+        h = stripped;
+    }
+
+    if (sscanf(h, "%u.%u.%u.%u%n", &a, &b, &c, &d, &n) == 4 &&
+        n == (int)strlen(h)) {
         if (a == 10) return true;
         if (a == 172 && b >= 16 && b <= 31) return true;
         if (a == 192 && b == 168) return true;
         if (a == 127) return true;
         if (a == 0) return true;
+        if (a == 169 && b == 254) return true;
         return false;
     }
-    if (!strcmp(host, "::1")) return true;
+
+    if (!strchr(h, ':')) return false;
+
+    char ipv6[64];
+    const char *pct = strchr(h, '%');
+    if (pct) {
+        size_t len = pct - h;
+        if (len >= sizeof(ipv6)) len = sizeof(ipv6) - 1;
+        memcpy(ipv6, h, len);
+        ipv6[len] = '\0';
+        h = ipv6;
+    }
+
+    if (!strcmp(h, "::1")) return true;
+
+    int iplen = (int)strlen(h);
+    if (iplen > 7 && h[iplen-7] == ':') {
+        int a6, b6, c6, d6;
+        if (sscanf(h + iplen - 7, ":%u.%u.%u.%u",
+                   &a6, &b6, &c6, &d6) == 4) {
+            if (a6 == 10 || a6 == 127 || a6 == 0) return true;
+            if (a6 == 172 && b6 >= 16 && b6 <= 31) return true;
+            if (a6 == 192 && b6 == 168) return true;
+            if (a6 == 169 && b6 == 254) return true;
+        }
+    }
+
+    const char *colon = strchr(h, ':');
+    if (colon) {
+        size_t glen = colon - h;
+        if (glen >= 2 && glen <= 4) {
+            if (h[0] == 'f' && (h[1] == 'c' || h[1] == 'd'))
+                return true;
+            if (glen >= 3 && h[0] == 'f' && h[1] == 'e' &&
+                ((h[2] >= '8' && h[2] <= '9') ||
+                 (h[2] >= 'a' && h[2] <= 'b') ||
+                 (h[2] >= 'A' && h[2] <= 'B')))
+                return true;
+        }
+    }
+
     return false;
 }
 #include "pageant.h" /* for AGENT_MAX_MSGLEN */
