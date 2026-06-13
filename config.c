@@ -2487,7 +2487,8 @@ void setup_config_box(struct controlbox *b, bool midsession,
         ctrl_settitle(b, "Connection/WebSocket", "Options for WebSocket proxy");
 
         s = ctrl_getset(b, "Connection/WebSocket", "proxy",
-                        "Configure the WebSocket proxy connection");
+                        "Configure the WebSocket proxy connection "
+                        "(local-machine setting, not saved per session)");
         ctrl_checkbox(s, "Enable WebSocket proxy (bypass SSH blocking)", 'e',
                       HELPCTX(no_help),
                       conf_checkbox_handler, I(CONF_ws_proxy_enable));

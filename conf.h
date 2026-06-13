@@ -157,31 +157,40 @@ CONF_OPTION(proxy_log_to_term,
     STORAGE_ENUM(on_off_auto),
 )
 
-/* WebSocket proxy options */
+/*
+ * WebSocket proxy options.
+ *
+ * These are PuTTYPlus extensions and are NOT written to per-session
+ * saved configuration files. The WebSocket proxy is treated as a
+ * local-machine feature: it is enabled by default and uses the
+ * built-in ssheasy.com:443 endpoint. Users can override the
+ * destination at runtime via the Connection/WebSocket UI panel,
+ * but those changes only persist for the current session.
+ */
 CONF_OPTION(ws_proxy_enable,
     VALUE_TYPE(BOOL),
-    DEFAULT_BOOL(false),
-    SAVE_KEYWORD("WSProxyEnable"),
+    DEFAULT_BOOL(true),
+    NOT_SAVED,
 )
 CONF_OPTION(ws_proxy_host,
     VALUE_TYPE(STR),
     DEFAULT_STR("ssheasy.com"),
-    SAVE_KEYWORD("WSProxyHost"),
+    NOT_SAVED,
 )
 CONF_OPTION(ws_proxy_port,
     VALUE_TYPE(INT),
     DEFAULT_INT(443),
-    SAVE_KEYWORD("WSProxyPort"),
+    NOT_SAVED,
 )
 CONF_OPTION(ws_proxy_tls,
     VALUE_TYPE(BOOL),
     DEFAULT_BOOL(true),
-    SAVE_KEYWORD("WSProxyTLS"),
+    NOT_SAVED,
 )
 CONF_OPTION(ws_proxy_path,
     VALUE_TYPE(STR),
     DEFAULT_STR("/p"),
-    SAVE_KEYWORD("WSProxyPath"),
+    NOT_SAVED,
 )
 
 /* SSH options */
