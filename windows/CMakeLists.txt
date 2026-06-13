@@ -123,6 +123,7 @@ add_sources_from_current_dir(plink wsnet.c)
 # PuTTYPlus-Term - console mode SSH client with WebSocket transport for Windows Terminal
 add_sources_from_current_dir(puttyplus-term
   wsseat.c wsnet.c no-jump-list.c nohelp.c plink.rc)
+target_compile_definitions(puttyplus-term PRIVATE PUTTYPLUS_CLI_WS_WAKE)
 
 # test_conf also needs wsnet.c because sshclient references ws_new_connection
 add_sources_from_current_dir(test_conf wsnet.c)

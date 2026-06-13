@@ -1,10 +1,129 @@
 #include "putty.h"
 #include "storage.h"
 
+#include <shellapi.h>
+#include <wchar.h>
+
 extern bool sesslist_demo_mode;
 extern Filename *dialog_box_demo_screenshot_filename;
 static strbuf *demo_terminal_data = NULL;
 static Filename *terminal_demo_screenshot_filename;
+
+static wchar_t *puttyplus_quote_wide_arg(const wchar_t *arg)
+{
+    wchar_t *ret = snewn(wcslen(arg) * 2 + 3, wchar_t);
+    wchar_t *out = ret;
+    int backslashes = 0;
+
+    *out++ = L'"';
+    while (*arg) {
+        if (*arg == L'\\') {
+            backslashes++;
+        } else if (*arg == L'"') {
+            while (backslashes-- > 0)
+                *out++ = L'\\';
+            *out++ = L'\\';
+            *out++ = L'"';
+            backslashes = 0;
+        } else {
+            while (backslashes-- > 0)
+                *out++ = L'\\';
+            *out++ = *arg;
+            backslashes = 0;
+        }
+        arg++;
+    }
+    while (backslashes-- > 0) {
+        *out++ = L'\\';
+        *out++ = L'\\';
+    }
+    *out++ = L'"';
+    *out = L'\0';
+    return ret;
+}
+
+static bool puttyplus_write_temp_conf(Conf *conf, wchar_t *path, size_t pathlen)
+{
+    wchar_t tempdir[MAX_PATH];
+    strbuf *serbuf;
+    HANDLE file;
+    DWORD written = 0;
+    bool ok = false;
+
+    if (!GetTempPathW(MAX_PATH, tempdir) ||
+        !GetTempFileNameW(tempdir, L"ppc", 0, path))
+        return false;
+
+    path[pathlen - 1] = L'\0';
+
+    serbuf = strbuf_new();
+    conf_serialise(BinarySink_UPCAST(serbuf), conf);
+
+    file = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                       FILE_ATTRIBUTE_TEMPORARY, NULL);
+    if (file != INVALID_HANDLE_VALUE) {
+        ok = (serbuf->len <= 0xffffffffU &&
+              WriteFile(file, serbuf->s, (DWORD)serbuf->len,
+                        &written, NULL) &&
+              written == serbuf->len);
+        CloseHandle(file);
+    }
+
+    if (!ok)
+        DeleteFileW(path);
+
+    strbuf_free(serbuf);
+    return ok;
+}
+
+static bool puttyplus_launch_windows_terminal(Conf *conf)
+{
+    wchar_t termexe[MAX_PATH];
+    wchar_t conffile[MAX_PATH];
+    wchar_t *slash, *qterm, *qconf, *params;
+    size_t params_len;
+    HINSTANCE result;
+
+    if (!puttyplus_write_temp_conf(conf, conffile, lenof(conffile)))
+        return false;
+
+    if (!GetModuleFileNameW(NULL, termexe, lenof(termexe))) {
+        DeleteFileW(conffile);
+        return false;
+    }
+    termexe[lenof(termexe) - 1] = L'\0';
+    slash = wcsrchr(termexe, L'\\');
+    if (!slash)
+        slash = wcsrchr(termexe, L'/');
+    if (!slash) {
+        DeleteFileW(conffile);
+        return false;
+    }
+    wcscpy(slash + 1, L"puttyplus-term.exe");
+
+    qterm = puttyplus_quote_wide_arg(termexe);
+    qconf = puttyplus_quote_wide_arg(conffile);
+    params_len = wcslen(qterm) + wcslen(qconf) + 96;
+    params = snewn(params_len, wchar_t);
+    swprintf(params, params_len,
+             L"new-tab --title PuTTYPlus -- %ls --puttyplus-no-wt "
+             L"--puttyplus-conf %ls",
+             qterm, qconf);
+
+    result = ShellExecuteW(NULL, L"open", L"wt.exe", params,
+                           NULL, SW_SHOWNORMAL);
+
+    sfree(params);
+    sfree(qconf);
+    sfree(qterm);
+
+    if ((INT_PTR)result <= 32) {
+        DeleteFileW(conffile);
+        return false;
+    }
+
+    return true;
+}
 
 const unsigned cmdline_tooltype =
     TOOLTYPE_HOST_ARG |
@@ -153,6 +272,10 @@ void gui_term_process_cmdline(Conf *conf, char *cmdline)
     }
 
     prepare_session(conf);
+
+    if (!demo_terminal_data && cmdline_host_ok(conf) &&
+        puttyplus_launch_windows_terminal(conf))
+        cleanup_exit(0);
 }
 
 const struct BackendVtable *backend_vt_from_conf(Conf *conf)

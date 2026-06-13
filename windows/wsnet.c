@@ -26,8 +26,12 @@ struct TLSState {
     bool ctx_init;
     SecPkgContext_StreamSizes sizes;
     bool active;
-    unsigned char extra[16384];
-    int extra_len;
+    unsigned char encbuf[65536];
+    size_t enc_len;
+    unsigned char plainbuf[65536];
+    size_t plain_pos;
+    size_t plain_len;
+    SECURITY_STATUS last_error;
 };
 
 struct WSSocket {
@@ -56,6 +60,7 @@ struct WSSocket {
     bool recv_queued;
 
     char *pending_error;
+    char pending_error_buf[128];
     struct IdempotentCallback error_ic;
     bool error_queued;
 
@@ -95,7 +100,9 @@ static int send_all(SOCKET s, const void *data, size_t len)
 static void tls_cleanup(struct TLSState *tls)
 {
     tls->active = false;
-    tls->extra_len = 0;
+    tls->enc_len = 0;
+    tls->plain_pos = 0;
+    tls->plain_len = 0;
     if (tls->ctx_init) {
         DeleteSecurityContext(&tls->hCtx);
         tls->ctx_init = false;
@@ -112,13 +119,13 @@ static bool tls_handshake(struct WSSocket *ws)
     SCHANNEL_CRED sc = {0};
     sc.dwVersion = SCHANNEL_CRED_VERSION;
     sc.dwFlags = SCH_CRED_MANUAL_CRED_VALIDATION | SCH_CRED_NO_DEFAULT_CREDS;
-    sc.grbitEnabledProtocols = SP_PROT_TLS1_2_SERVER;
+    sc.grbitEnabledProtocols = SP_PROT_TLS1_2_CLIENT;
     TimeStamp expiry;
 
-    SECURITY_STATUS ret = AcquireCredentialsHandle(
-        NULL, UNISP_NAME, SECPKG_CRED_OUTBOUND,
+    SECURITY_STATUS ret = AcquireCredentialsHandleA(
+        NULL, UNISP_NAME_A, SECPKG_CRED_OUTBOUND,
         NULL, &sc, NULL, NULL, &tls->hCred, &expiry);
-    if (ret != SEC_E_OK) return false;
+    if (ret != SEC_E_OK) { tls->last_error = ret; return false; }
     tls->cred_init = true;
 
     bool first_pass = true;
@@ -131,7 +138,7 @@ static bool tls_handshake(struct WSSocket *ws)
         if (ret == SEC_E_INCOMPLETE_MESSAGE) {
             int n = recv(ws->s, (char *)recv_buf + recv_len,
                          (int)sizeof(recv_buf) - recv_len, 0);
-            if (n <= 0) { tls_cleanup(tls); return false; }
+            if (n <= 0) { tls->last_error = SEC_E_INTERNAL_ERROR; tls_cleanup(tls); return false; }
             recv_len += n;
         }
 
@@ -149,21 +156,28 @@ static bool tls_handshake(struct WSSocket *ws)
         inBufs[0].pvBuffer = recv_buf;
         inBufs[0].cbBuffer = recv_len;
         inBufs[1].BufferType = SECBUFFER_EMPTY;
+        inBufs[1].pvBuffer = NULL;
+        inBufs[1].cbBuffer = 0;
         SecBufferDesc inDesc;
         inDesc.ulVersion = SECBUFFER_VERSION;
         inDesc.cBuffers = 2;
         inDesc.pBuffers = inBufs;
 
-        ret = InitializeSecurityContext(
+        ret = InitializeSecurityContextA(
             &tls->hCred,
             first_pass ? NULL : &tls->hCtx,
-            NULL,
+            (SEC_CHAR *)ws->proxy_host,
+            ISC_REQ_ALLOCATE_MEMORY |
             ISC_REQ_CONFIDENTIALITY | ISC_REQ_REPLAY_DETECT |
-            ISC_REQ_SEQUENCE_DETECT | ISC_REQ_STREAM,
+            ISC_REQ_SEQUENCE_DETECT | ISC_REQ_STREAM
+#ifdef ISC_REQ_MANUAL_CRED_VALIDATION
+            | ISC_REQ_MANUAL_CRED_VALIDATION
+#endif
+            ,
             0, 0,
             first_pass ? NULL : &inDesc,
             0,
-            first_pass ? &tls->hCtx : NULL,
+            &tls->hCtx,
             &outDesc, &attr, &expiry);
         first_pass = false;
         if (ret == SEC_E_OK || ret == SEC_I_CONTINUE_NEEDED ||
@@ -175,6 +189,7 @@ static bool tls_handshake(struct WSSocket *ws)
                 if (send_all(ws->s, outBufs[0].pvBuffer,
                              outBufs[0].cbBuffer) == SOCKET_ERROR) {
                     FreeContextBuffer(outBufs[0].pvBuffer);
+                    tls->last_error = SEC_E_INTERNAL_ERROR;
                     tls_cleanup(tls);
                     return false;
                 }
@@ -182,26 +197,41 @@ static bool tls_handshake(struct WSSocket *ws)
             }
 
             if (inBufs[1].BufferType == SECBUFFER_EXTRA && inBufs[1].cbBuffer > 0) {
-                memmove(recv_buf,
-                        (unsigned char *)inBufs[1].pvBuffer, inBufs[1].cbBuffer);
-                recv_len = inBufs[1].cbBuffer;
+                size_t extra = inBufs[1].cbBuffer;
+                if (extra > (size_t)recv_len) {
+                    tls->last_error = SEC_E_INTERNAL_ERROR;
+                    tls_cleanup(tls);
+                    return false;
+                }
+                memmove(recv_buf, recv_buf + recv_len - extra, extra);
+                recv_len = (int)extra;
             } else {
                 recv_len = 0;
             }
 
             if (ret == SEC_I_CONTINUE_NEEDED && recv_len == 0) {
                 int n = recv(ws->s, (char *)recv_buf, (int)sizeof(recv_buf), 0);
-                if (n <= 0) { tls_cleanup(tls); return false; }
+                if (n <= 0) { tls->last_error = SEC_E_INTERNAL_ERROR; tls_cleanup(tls); return false; }
                 recv_len = n;
             }
         }
     }
 
-    if (ret != SEC_E_OK) { tls_cleanup(tls); return false; }
+    if (ret != SEC_E_OK) { tls->last_error = ret; tls_cleanup(tls); return false; }
 
     ret = QueryContextAttributes(
         &tls->hCtx, SECPKG_ATTR_STREAM_SIZES, &tls->sizes);
-    if (ret != SEC_E_OK) { tls_cleanup(tls); return false; }
+    if (ret != SEC_E_OK) { tls->last_error = ret; tls_cleanup(tls); return false; }
+
+    if (recv_len > 0) {
+        if ((size_t)recv_len > sizeof(tls->encbuf)) {
+            tls_cleanup(tls);
+            tls->last_error = SEC_E_INTERNAL_ERROR;
+            return false;
+        }
+        memcpy(tls->encbuf, recv_buf, (size_t)recv_len);
+        tls->enc_len = (size_t)recv_len;
+    }
 
     tls->active = true;
     return true;
@@ -213,37 +243,49 @@ static int tls_encrypt_send(struct WSSocket *ws,
     struct TLSState *tls = &ws->tls;
     if (!tls->active) return send_all(ws->s, data, len);
 
-    size_t msgSize = tls->sizes.cbHeader + len + tls->sizes.cbTrailer;
-    unsigned char *msg = (unsigned char *)malloc(msgSize);
-    if (!msg) return SOCKET_ERROR;
+    size_t total_sent = 0;
+    while (total_sent < len) {
+        size_t chunk = len - total_sent;
+        if (tls->sizes.cbMaximumMessage > 0 &&
+            chunk > tls->sizes.cbMaximumMessage)
+            chunk = tls->sizes.cbMaximumMessage;
 
-    SecBuffer bufs[4];
-    bufs[0].BufferType = SECBUFFER_STREAM_HEADER;
-    bufs[0].cbBuffer = tls->sizes.cbHeader;
-    bufs[0].pvBuffer = msg;
-    bufs[1].BufferType = SECBUFFER_DATA;
-    bufs[1].cbBuffer = (unsigned long)len;
-    bufs[1].pvBuffer = msg + tls->sizes.cbHeader;
-    memcpy(bufs[1].pvBuffer, data, len);
-    bufs[2].BufferType = SECBUFFER_STREAM_TRAILER;
-    bufs[2].cbBuffer = tls->sizes.cbTrailer;
-    bufs[2].pvBuffer = msg + tls->sizes.cbHeader + len;
-    bufs[3].BufferType = SECBUFFER_EMPTY;
+        size_t msgSize = tls->sizes.cbHeader + chunk + tls->sizes.cbTrailer;
+        unsigned char *msg = (unsigned char *)malloc(msgSize);
+        if (!msg) return SOCKET_ERROR;
 
-    SecBufferDesc desc;
-    desc.ulVersion = SECBUFFER_VERSION;
-    desc.cBuffers = 4;
-    desc.pBuffers = bufs;
+        SecBuffer bufs[4];
+        bufs[0].BufferType = SECBUFFER_STREAM_HEADER;
+        bufs[0].cbBuffer = tls->sizes.cbHeader;
+        bufs[0].pvBuffer = msg;
+        bufs[1].BufferType = SECBUFFER_DATA;
+        bufs[1].cbBuffer = (unsigned long)chunk;
+        bufs[1].pvBuffer = msg + tls->sizes.cbHeader;
+        memcpy(bufs[1].pvBuffer, data + total_sent, chunk);
+        bufs[2].BufferType = SECBUFFER_STREAM_TRAILER;
+        bufs[2].cbBuffer = tls->sizes.cbTrailer;
+        bufs[2].pvBuffer = msg + tls->sizes.cbHeader + chunk;
+        bufs[3].BufferType = SECBUFFER_EMPTY;
 
-    SECURITY_STATUS ret = EncryptMessage(&tls->hCtx, 0, &desc, 0);
-    if (ret != SEC_E_OK) { free(msg); return SOCKET_ERROR; }
+        SecBufferDesc desc;
+        desc.ulVersion = SECBUFFER_VERSION;
+        desc.cBuffers = 4;
+        desc.pBuffers = bufs;
 
-    size_t total = (size_t)bufs[0].cbBuffer +
-                   (size_t)bufs[1].cbBuffer +
-                   (size_t)bufs[2].cbBuffer;
-    int result = send_all(ws->s, msg, total);
-    free(msg);
-    return result;
+        SECURITY_STATUS ret = EncryptMessage(&tls->hCtx, 0, &desc, 0);
+        if (ret != SEC_E_OK) { free(msg); return SOCKET_ERROR; }
+
+        size_t total = (size_t)bufs[0].cbBuffer +
+                       (size_t)bufs[1].cbBuffer +
+                       (size_t)bufs[2].cbBuffer;
+        int result = send_all(ws->s, msg, total);
+        free(msg);
+        if (result == SOCKET_ERROR)
+            return SOCKET_ERROR;
+        total_sent += chunk;
+    }
+
+    return (int)len;
 }
 
 static int tls_decrypt_recv(struct WSSocket *ws,
@@ -254,58 +296,101 @@ static int tls_decrypt_recv(struct WSSocket *ws,
         return recv(ws->s, (char *)buf, (int)bufSize, 0);
     }
 
-    int raw_len;
-    if (tls->extra_len > 0) {
-        memcpy(buf, tls->extra, (size_t)tls->extra_len);
-        raw_len = tls->extra_len;
-        tls->extra_len = 0;
-        int n = recv(ws->s, (char *)buf + raw_len,
-                     (int)(bufSize - (size_t)raw_len), 0);
-        if (n <= 0) return (raw_len > 0) ? raw_len : n;
-        raw_len += n;
-    } else {
-        int n = recv(ws->s, (char *)buf, (int)bufSize, 0);
-        if (n <= 0) return n;
-        raw_len = n;
-    }
-
-    SecBuffer bufs[4];
-    bufs[0].BufferType = SECBUFFER_DATA;
-    bufs[0].cbBuffer = raw_len;
-    bufs[0].pvBuffer = buf;
-    bufs[1].BufferType = SECBUFFER_EMPTY;
-    bufs[2].BufferType = SECBUFFER_EMPTY;
-    bufs[3].BufferType = SECBUFFER_EMPTY;
-
-    SecBufferDesc desc;
-    desc.ulVersion = SECBUFFER_VERSION;
-    desc.cBuffers = 4;
-    desc.pBuffers = bufs;
-
-    SECURITY_STATUS ret = DecryptMessage(&tls->hCtx, &desc, 0, NULL);
-    if (ret == SEC_E_INCOMPLETE_MESSAGE) return 0;
-    if (ret != SEC_E_OK) return -1;
-
-    for (int i = 0; i < 4; i++) {
-        if (bufs[i].BufferType == SECBUFFER_DATA) {
-            int dlen = bufs[i].cbBuffer;
-            if ((size_t)dlen > bufSize) dlen = (int)bufSize;
-            memmove(buf, bufs[i].pvBuffer, (size_t)dlen);
-
-            for (int j = 0; j < 4; j++) {
-                if (bufs[j].BufferType == SECBUFFER_EXTRA &&
-                    bufs[j].cbBuffer > 0) {
-                    size_t remain = (size_t)bufs[j].cbBuffer;
-                    if (remain > sizeof(tls->extra))
-                        remain = sizeof(tls->extra);
-                    memcpy(tls->extra, bufs[j].pvBuffer, remain);
-                    tls->extra_len = (int)remain;
-                }
-            }
-            return dlen;
+    if (tls->plain_pos < tls->plain_len) {
+        size_t avail = tls->plain_len - tls->plain_pos;
+        if (avail > bufSize) avail = bufSize;
+        memcpy(buf, tls->plainbuf + tls->plain_pos, avail);
+        tls->plain_pos += avail;
+        if (tls->plain_pos == tls->plain_len) {
+            tls->plain_pos = 0;
+            tls->plain_len = 0;
         }
+        return (int)avail;
     }
-    return -1;
+
+    for (;;) {
+        if (tls->enc_len == 0) {
+            int n = recv(ws->s, (char *)tls->encbuf,
+                         (int)sizeof(tls->encbuf), 0);
+            if (n <= 0) return n;
+            tls->enc_len = (size_t)n;
+        }
+
+        SecBuffer bufs[4];
+        bufs[0].BufferType = SECBUFFER_DATA;
+        bufs[0].cbBuffer = (unsigned long)tls->enc_len;
+        bufs[0].pvBuffer = tls->encbuf;
+        bufs[1].BufferType = SECBUFFER_EMPTY;
+        bufs[2].BufferType = SECBUFFER_EMPTY;
+        bufs[3].BufferType = SECBUFFER_EMPTY;
+
+        SecBufferDesc desc;
+        desc.ulVersion = SECBUFFER_VERSION;
+        desc.cBuffers = 4;
+        desc.pBuffers = bufs;
+
+        SECURITY_STATUS ret = DecryptMessage(&tls->hCtx, &desc, 0, NULL);
+        if (ret == SEC_E_INCOMPLETE_MESSAGE) {
+            if (tls->enc_len == sizeof(tls->encbuf))
+                return -1;
+            int n = recv(ws->s, (char *)tls->encbuf + tls->enc_len,
+                         (int)(sizeof(tls->encbuf) - tls->enc_len), 0);
+            if (n <= 0) return n;
+            tls->enc_len += (size_t)n;
+            continue;
+        }
+        if (ret != SEC_E_OK)
+            return -1;
+
+        unsigned char *plain = NULL;
+        size_t plain_len = 0;
+        unsigned char *extra = NULL;
+        size_t extra_len = 0;
+
+        for (int i = 0; i < 4; i++) {
+            if (bufs[i].BufferType == SECBUFFER_DATA) {
+                plain = (unsigned char *)bufs[i].pvBuffer;
+                plain_len = (size_t)bufs[i].cbBuffer;
+            } else if (bufs[i].BufferType == SECBUFFER_EXTRA) {
+                extra = (unsigned char *)bufs[i].pvBuffer;
+                extra_len = (size_t)bufs[i].cbBuffer;
+            }
+        }
+
+        if (extra_len > 0) {
+            memmove(tls->encbuf, extra, extra_len);
+            tls->enc_len = extra_len;
+        } else {
+            tls->enc_len = 0;
+        }
+
+        if (plain_len == 0)
+            continue;
+
+        if (plain_len > sizeof(tls->plainbuf))
+            return -1;
+        memcpy(tls->plainbuf, plain, plain_len);
+
+        tls->plain_pos = 0;
+        tls->plain_len = plain_len;
+
+        size_t out = plain_len;
+        if (out > bufSize) out = bufSize;
+        memcpy(buf, tls->plainbuf, out);
+        tls->plain_pos = out;
+        if (tls->plain_pos == tls->plain_len) {
+            tls->plain_pos = 0;
+            tls->plain_len = 0;
+        }
+        return (int)out;
+    }
+}
+
+static bool tls_has_pending_data(struct WSSocket *ws)
+{
+    struct TLSState *tls = &ws->tls;
+    return tls->active &&
+        (tls->enc_len > 0 || tls->plain_pos < tls->plain_len);
 }
 
 /* --- WebSocket frame helpers --- */
@@ -345,6 +430,9 @@ static int wsnet_send_frame(struct WSSocket *ws,
 
     if (tls_encrypt_send(ws, header, hdr_len) == SOCKET_ERROR)
         return SOCKET_ERROR;
+
+    if (len == 0)
+        return 0;
 
     unsigned char *masked = (unsigned char *)malloc(len);
     if (!masked) return SOCKET_ERROR;
@@ -429,6 +517,52 @@ static bool validate_accept(const char *accept, const char *key)
     return strcmp(accept, expected_b64) == 0;
 }
 
+static const char *find_http_header(const char *headers, const char *name)
+{
+    size_t name_len = strlen(name);
+    const char *line = headers;
+
+    while (*line) {
+        const char *next = strstr(line, "\r\n");
+        size_t line_len = next ? (size_t)(next - line) : strlen(line);
+        if (line_len > name_len && line[name_len] == ':' &&
+            strnicmp(line, name, name_len) == 0) {
+            const char *value = line + name_len + 1;
+            while (*value == ' ' || *value == '\t')
+                value++;
+            return value;
+        }
+        if (!next)
+            break;
+        line = next + 2;
+    }
+
+    return NULL;
+}
+
+static int wsnet_json_escape(char *out, size_t outlen, const char *in)
+{
+    size_t pos = 0;
+
+    for (const unsigned char *p = (const unsigned char *)in; *p; p++) {
+        if (*p == '"' || *p == '\\') {
+            if (pos + 2 >= outlen) return -1;
+            out[pos++] = '\\';
+            out[pos++] = (char)*p;
+        } else if (*p < 0x20) {
+            if (pos + 7 >= outlen) return -1;
+            sprintf(out + pos, "\\u%04x", *p);
+            pos += 6;
+        } else {
+            if (pos + 1 >= outlen) return -1;
+            out[pos++] = (char)*p;
+        }
+    }
+
+    out[pos] = '\0';
+    return (int)pos;
+}
+
 /* Structured JSON check for {"status":"ok"} */
 static bool check_json_ok(const char *json)
 {
@@ -495,7 +629,7 @@ static void populate_endpoint_info(SOCKET s, struct WSSocket *ws)
 static const char *wsnet_socket_error(Socket *s)
 {
     struct WSSocket *ws = container_of(s, struct WSSocket, vt);
-    return ws->error ? ws->error : "";
+    return ws->error;
 }
 
 static Plug *wsnet_plug(Socket *s, Plug *p)
@@ -511,6 +645,10 @@ static void wsnet_queue_recv(struct WSSocket *ws)
     if (!ws->recv_queued) {
         ws->recv_queued = true;
         queue_idempotent_callback(&ws->recv_ic);
+#ifdef PUTTYPLUS_CLI_WS_WAKE
+        if (winselcli_event != INVALID_HANDLE_VALUE)
+            SetEvent(winselcli_event);
+#endif
     }
 }
 
@@ -519,6 +657,10 @@ static void wsnet_queue_error(struct WSSocket *ws)
     if (!ws->error_queued) {
         ws->error_queued = true;
         queue_idempotent_callback(&ws->error_ic);
+#ifdef PUTTYPLUS_CLI_WS_WAKE
+        if (winselcli_event != INVALID_HANDLE_VALUE)
+            SetEvent(winselcli_event);
+#endif
     }
 }
 
@@ -527,6 +669,10 @@ static void wsnet_queue_connect(struct WSSocket *ws)
     if (!ws->connect_queued) {
         ws->connect_queued = true;
         queue_idempotent_callback(&ws->connect_ic);
+#ifdef PUTTYPLUS_CLI_WS_WAKE
+        if (winselcli_event != INVALID_HANDLE_VALUE)
+            SetEvent(winselcli_event);
+#endif
     }
 }
 
@@ -593,7 +739,10 @@ static DWORD WINAPI wsnet_thread(LPVOID param)
 
     if (ws->use_tls) {
         if (!tls_handshake(ws)) {
-            ws->pending_error = "WebSocket: TLS handshake failed";
+            sprintf(ws->pending_error_buf,
+                    "WebSocket: TLS handshake failed (0x%08lx)",
+                    (unsigned long)ws->tls.last_error);
+            ws->pending_error = ws->pending_error_buf;
             closesocket(ws->s);
             ws->s = INVALID_SOCKET;
             wsnet_queue_error(ws);
@@ -604,7 +753,8 @@ static DWORD WINAPI wsnet_thread(LPVOID param)
     char key_b64[64];
     wsnet_generate_key(key_b64);
 
-    const char *path = ws->proxy_path ? ws->proxy_path : "/p";
+    const char *path = ws->proxy_path && ws->proxy_path[0] ?
+                       ws->proxy_path : "/p";
 
     char handshake[1024];
     int hlen = sprintf(handshake,
@@ -627,6 +777,8 @@ static DWORD WINAPI wsnet_thread(LPVOID param)
     }
 
     char resp[4096];
+    unsigned char handshake_extra[4096];
+    size_t handshake_extra_len = 0;
     int total = 0;
     bool got_headers = false;
     while (!got_headers) {
@@ -642,14 +794,24 @@ static DWORD WINAPI wsnet_thread(LPVOID param)
         }
         total += ret;
         resp[total] = '\0';
-        if (strstr(resp, "\r\n\r\n")) got_headers = true;
+        char *header_end = strstr(resp, "\r\n\r\n");
+        if (header_end) {
+            got_headers = true;
+            size_t body_offset = (size_t)(header_end + 4 - resp);
+            if ((size_t)total > body_offset) {
+                handshake_extra_len = (size_t)total - body_offset;
+                if (handshake_extra_len > sizeof(handshake_extra))
+                    handshake_extra_len = sizeof(handshake_extra);
+                memcpy(handshake_extra, resp + body_offset, handshake_extra_len);
+                resp[body_offset] = '\0';
+            }
+        }
     }
 
     int status;
     char accept_hdr[128] = "";
-    char *accept_ptr = strstr(resp, "Sec-WebSocket-Accept: ");
+    const char *accept_ptr = find_http_header(resp, "Sec-WebSocket-Accept");
     if (accept_ptr) {
-        accept_ptr += 22;
         int alen = 0;
         while (accept_ptr[alen] && accept_ptr[alen] != '\r' && alen < 120)
             alen++;
@@ -657,7 +819,7 @@ static DWORD WINAPI wsnet_thread(LPVOID param)
         accept_hdr[alen] = '\0';
     }
 
-    if (sscanf(resp, "HTTP/1.1 %d", &status) != 1 || status != 101) {
+    if (sscanf(resp, "HTTP/%*d.%*d %d", &status) != 1 || status != 101) {
         ws->pending_error = "WebSocket: server rejected upgrade";
         tls_cleanup(&ws->tls);
         closesocket(ws->s);
@@ -666,7 +828,7 @@ static DWORD WINAPI wsnet_thread(LPVOID param)
         return 1;
     }
 
-    if (accept_hdr[0] && !validate_accept(accept_hdr, key_b64)) {
+    if (!accept_hdr[0] || !validate_accept(accept_hdr, key_b64)) {
         ws->pending_error = "WebSocket: invalid Sec-WebSocket-Accept";
         tls_cleanup(&ws->tls);
         closesocket(ws->s);
@@ -678,11 +840,22 @@ static DWORD WINAPI wsnet_thread(LPVOID param)
     ws->connected = true;
     wsnet_queue_connect(ws);
 
-    char init_msg[256];
+    char escaped_host[256];
+    if (wsnet_json_escape(escaped_host, sizeof(escaped_host),
+                          ws->target_host) < 0) {
+        ws->pending_error = "WebSocket: target host is too long";
+        tls_cleanup(&ws->tls);
+        closesocket(ws->s);
+        ws->s = INVALID_SOCKET;
+        wsnet_queue_error(ws);
+        return 1;
+    }
+
+    char init_msg[512];
     int init_len = sprintf(init_msg,
-        "{\"host\":\"%s\",\"port\":%d}",
-        ws->target_host, ws->target_port);
-    wsnet_send_frame(ws, (const unsigned char *)init_msg, init_len, 0x1);
+        "{\"Host\":\"%s\",\"Port\":%d}\n",
+        escaped_host, ws->target_port);
+    wsnet_send_frame(ws, (const unsigned char *)init_msg, init_len, 0x2);
 
     unsigned char *frame_buf = (unsigned char *)malloc(65536);
     if (!frame_buf) {
@@ -694,6 +867,11 @@ static DWORD WINAPI wsnet_thread(LPVOID param)
         return 1;
     }
     size_t frame_pos = 0;
+    if (handshake_extra_len > 0) {
+        memcpy(frame_buf, handshake_extra, handshake_extra_len);
+        frame_pos = handshake_extra_len;
+    }
+
     bool expecting_json = true;
     int json_len = 0;
     char json_buf[4096];
@@ -709,14 +887,19 @@ static DWORD WINAPI wsnet_thread(LPVOID param)
         }
         LeaveCriticalSection(&ws->lock);
 
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(ws->s, &rfds);
-        tv.tv_sec = 0;
-        tv.tv_usec = 100000;
-        int sel = select(0, &rfds, NULL, NULL, &tv);
+        bool readable = tls_has_pending_data(ws);
+        int sel = 0;
+        if (!readable) {
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(ws->s, &rfds);
+            tv.tv_sec = 0;
+            tv.tv_usec = 100000;
+            sel = select(0, &rfds, NULL, NULL, &tv);
+            readable = sel > 0 && FD_ISSET(ws->s, &rfds);
+        }
 
-        if (sel > 0 && FD_ISSET(ws->s, &rfds)) {
+        if (readable) {
             int ret;
             if (ws->use_tls) {
                 unsigned char tls_buf[65536];
@@ -737,7 +920,13 @@ static DWORD WINAPI wsnet_thread(LPVOID param)
                 wsnet_queue_error(ws);
                 break;
             }
+        } else if (sel == SOCKET_ERROR) {
+            ws->pending_error = "WebSocket: select failed";
+            wsnet_queue_error(ws);
+            break;
+        }
 
+        if (frame_pos > 0) {
             size_t consumed = 0;
             while (consumed < frame_pos) {
                 if (frame_pos - consumed < 2) break;
@@ -766,10 +955,11 @@ static DWORD WINAPI wsnet_thread(LPVOID param)
 
                 unsigned char *payload = f + hdr;
                 if (masked) {
+                    unsigned char *mask = f + hdr;
+                    payload = f + hdr + 4;
                     for (size_t i = 0; i < payload_len; i++)
-                        payload[i] ^= payload[-4 + (i & 3)];
+                        payload[i] ^= mask[i & 3];
                     hdr += 4;
-                    payload = f + hdr;
                 }
 
                 if (opcode == 0x8) {
@@ -778,8 +968,7 @@ static DWORD WINAPI wsnet_thread(LPVOID param)
                 }
 
                 if (opcode == 0x9) {
-                    unsigned char pong[2] = {0x8A, 0x00};
-                    tls_encrypt_send(ws, pong, 2);
+                    wsnet_send_frame(ws, payload, payload_len, 0xA);
                     consumed += hdr + payload_len;
                     continue;
                 }
@@ -818,7 +1007,7 @@ static DWORD WINAPI wsnet_thread(LPVOID param)
                     break;
                 }
                 json_len = 0;
-                expecting_json = true;
+                expecting_json = false;
             }
         }
     }
@@ -849,16 +1038,14 @@ static DWORD WINAPI wsnet_thread(LPVOID param)
 static void wsnet_recv_idempotent(void *ctx)
 {
     struct WSSocket *ws = (struct WSSocket *)ctx;
-    ws->recv_queued = false;
 
     EnterCriticalSection(&ws->lock);
-    while (bufchain_size(&ws->recv_queue) > 0) {
+    ws->recv_queued = false;
+    while (!ws->frozen && bufchain_size(&ws->recv_queue) > 0) {
         ptrlen data = bufchain_prefix(&ws->recv_queue);
-        if (!ws->frozen) {
-            LeaveCriticalSection(&ws->lock);
-            plug_receive(ws->plug, 0, data.ptr, data.len);
-            EnterCriticalSection(&ws->lock);
-        }
+        LeaveCriticalSection(&ws->lock);
+        plug_receive(ws->plug, 0, data.ptr, data.len);
+        EnterCriticalSection(&ws->lock);
         bufchain_consume(&ws->recv_queue, data.len);
     }
     LeaveCriticalSection(&ws->lock);
@@ -935,7 +1122,15 @@ static void wsnet_write_eof(Socket *s)
 static void wsnet_set_frozen(Socket *s, bool is_frozen)
 {
     struct WSSocket *ws = container_of(s, struct WSSocket, vt);
+    bool queue_recv;
+
+    EnterCriticalSection(&ws->lock);
     ws->frozen = is_frozen;
+    queue_recv = !is_frozen && bufchain_size(&ws->recv_queue) > 0;
+    LeaveCriticalSection(&ws->lock);
+
+    if (queue_recv)
+        wsnet_queue_recv(ws);
 }
 
 static SocketEndpointInfo *wsnet_endpoint_info(Socket *s, bool peer)
@@ -987,6 +1182,10 @@ Socket *ws_new_connection(const char *hostname, int port,
     ws->proxy_port = conf_get_int(conf, CONF_ws_proxy_port);
     ws->proxy_path = dupstr(conf_get_str(conf, CONF_ws_proxy_path));
     ws->use_tls = conf_get_bool(conf, CONF_ws_proxy_tls);
+
+#ifdef PUTTYPLUS_CLI_WS_WAKE
+    winselcli_setup();
+#endif
 
     ws->recv_ic.fn = wsnet_recv_idempotent;
     ws->recv_ic.ctx = ws;

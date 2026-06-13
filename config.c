@@ -2491,15 +2491,15 @@ void setup_config_box(struct controlbox *b, bool midsession,
         ctrl_checkbox(s, "Enable WebSocket proxy (bypass SSH blocking)", 'e',
                       HELPCTX(no_help),
                       conf_checkbox_handler, I(CONF_ws_proxy_enable));
-        ctrl_editbox(s, "WebSocket proxy host:", 'h', 100,
+        ctrl_editbox(s, "WebSocket proxy host:", 's', 100,
                      HELPCTX(no_help),
-                     conf_editbox_handler, I(CONF_ws_proxy_host), I(0));
+                     conf_editbox_handler, I(CONF_ws_proxy_host), ED_STR);
         ctrl_editbox(s, "WebSocket proxy port:", 'p', 20,
                      HELPCTX(no_help),
-                     conf_editbox_handler, I(CONF_ws_proxy_port), I(0));
+                     conf_editbox_handler, I(CONF_ws_proxy_port), ED_INT);
         ctrl_editbox(s, "WebSocket path:", 'w', 100,
                      HELPCTX(no_help),
-                     conf_editbox_handler, I(CONF_ws_proxy_path), I(0));
+                     conf_editbox_handler, I(CONF_ws_proxy_path), ED_STR);
         ctrl_checkbox(s, "Use TLS (WSS)", 't',
                       HELPCTX(no_help),
                       conf_checkbox_handler, I(CONF_ws_proxy_tls));

@@ -1,10 +1,144 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <wchar.h>
 
 #include "putty.h"
+#include <shellapi.h>
 #include "ssh.h"
 #include "storage.h"
 #include "wsseat.h"
+
+static wchar_t *puttyplus_quote_wide_arg(const wchar_t *arg)
+{
+    wchar_t *ret = snewn(wcslen(arg) * 2 + 3, wchar_t);
+    wchar_t *out = ret;
+    int backslashes = 0;
+
+    *out++ = L'"';
+    while (*arg) {
+        if (*arg == L'\\') {
+            backslashes++;
+        } else if (*arg == L'"') {
+            while (backslashes-- > 0)
+                *out++ = L'\\';
+            *out++ = L'\\';
+            *out++ = L'"';
+            backslashes = 0;
+        } else {
+            while (backslashes-- > 0)
+                *out++ = L'\\';
+            *out++ = *arg;
+            backslashes = 0;
+        }
+        arg++;
+    }
+    while (backslashes-- > 0) {
+        *out++ = L'\\';
+        *out++ = L'\\';
+    }
+    *out++ = L'"';
+    *out = L'\0';
+    return ret;
+}
+
+static bool puttyplus_running_in_windows_terminal(void)
+{
+    wchar_t buf[2];
+    return GetEnvironmentVariableW(L"WT_SESSION", buf, lenof(buf)) > 0;
+}
+
+static bool puttyplus_command_has_no_wt_flag(CmdlineArgList *arglist)
+{
+    for (size_t i = 0; arglist->args[i]; i++) {
+        const char *p = cmdline_arg_to_str(arglist->args[i]);
+        if (!strcmp(p, "--puttyplus-no-wt"))
+            return true;
+    }
+    return false;
+}
+
+static bool puttyplus_relaunch_self_in_windows_terminal(CmdlineArgList *arglist)
+{
+    wchar_t module[MAX_PATH];
+    wchar_t *qmodule, *params;
+    size_t params_len = 96;
+    HINSTANCE result;
+
+    if (!arglist->args[0] ||
+        puttyplus_running_in_windows_terminal() ||
+        puttyplus_command_has_no_wt_flag(arglist))
+        return false;
+
+    if (!GetModuleFileNameW(NULL, module, lenof(module)))
+        return false;
+    module[lenof(module) - 1] = L'\0';
+
+    qmodule = puttyplus_quote_wide_arg(module);
+    params_len += wcslen(qmodule);
+    for (size_t i = 0; arglist->args[i]; i++) {
+        Filename *fn = cmdline_arg_to_filename(arglist->args[i]);
+        wchar_t *qarg = puttyplus_quote_wide_arg(filename_to_wstr(fn));
+        params_len += wcslen(qarg) + 1;
+        sfree(qarg);
+        filename_free(fn);
+    }
+
+    params = snewn(params_len, wchar_t);
+    swprintf(params, params_len,
+             L"new-tab --title PuTTYPlus -- %ls --puttyplus-no-wt",
+             qmodule);
+
+    for (size_t i = 0; arglist->args[i]; i++) {
+        Filename *fn = cmdline_arg_to_filename(arglist->args[i]);
+        wchar_t *qarg = puttyplus_quote_wide_arg(filename_to_wstr(fn));
+        wcscat(params, L" ");
+        wcscat(params, qarg);
+        sfree(qarg);
+        filename_free(fn);
+    }
+
+    result = ShellExecuteW(NULL, L"open", L"wt.exe", params,
+                           NULL, SW_SHOWNORMAL);
+
+    sfree(params);
+    sfree(qmodule);
+    return (INT_PTR)result > 32;
+}
+
+static bool puttyplus_load_conf_file(Conf *conf, CmdlineArg *arg)
+{
+    Filename *fn = cmdline_arg_to_filename(arg);
+    FILE *fp = f_open(fn, "rb", false);
+    strbuf *buf;
+    bool ok = false;
+
+    if (!fp) {
+        filename_free(fn);
+        return false;
+    }
+
+    buf = strbuf_new();
+    while (true) {
+        char tmp[4096];
+        size_t ret = fread(tmp, 1, sizeof(tmp), fp);
+        if (ret > 0)
+            put_data(buf, tmp, ret);
+        if (ret < sizeof(tmp))
+            break;
+    }
+
+    if (!ferror(fp) && buf->len > 0) {
+        BinarySource src[1];
+        BinarySource_BARE_INIT(src, buf->s, buf->len);
+        ok = conf_deserialise(conf, src);
+    }
+    fclose(fp);
+
+    DeleteFileW(filename_to_wstr(fn));
+    filename_free(fn);
+    strbuf_free(buf);
+    return ok;
+}
 
 const unsigned cmdline_tooltype =
     TOOLTYPE_HOST_ARG |
@@ -57,6 +191,7 @@ int main(int argc, char **argv)
     WsSeat *ws;
     int exitcode;
     bool errors;
+    bool loaded_conf_file;
 
     dll_hijacking_protection();
     enable_dit();
@@ -70,13 +205,37 @@ int main(int argc, char **argv)
     settings_set_default_port(conf_get_int(conf, CONF_port));
     conf_set_bool(conf, CONF_ws_proxy_enable, true);
     errors = false;
+    loaded_conf_file = false;
 
     CmdlineArgList *arglist = cmdline_arg_list_from_GetCommandLineW();
+    if (puttyplus_relaunch_self_in_windows_terminal(arglist)) {
+        cmdline_arg_list_free(arglist);
+        return 0;
+    }
+
     size_t arglistpos = 0;
     while (arglist->args[arglistpos]) {
         CmdlineArg *arg = arglist->args[arglistpos++];
         CmdlineArg *nextarg = arglist->args[arglistpos];
         const char *p = cmdline_arg_to_str(arg);
+        if (!strcmp(p, "--puttyplus-no-wt")) {
+            continue;
+        } else if (!strcmp(p, "--puttyplus-conf")) {
+            if (!nextarg) {
+                fprintf(stderr,
+                        "puttyplus-term: option \"%s\" requires an argument\n",
+                        p);
+                errors = true;
+            } else if (!puttyplus_load_conf_file(conf, nextarg)) {
+                fprintf(stderr,
+                        "puttyplus-term: could not load configuration file\n");
+                errors = true;
+            } else {
+                loaded_conf_file = true;
+                arglistpos++;
+            }
+            continue;
+        }
         int ret = cmdline_process_param(arg, nextarg, 1, conf);
         if (ret == -2) {
             fprintf(stderr,
@@ -126,7 +285,9 @@ int main(int argc, char **argv)
     }
 
     prepare_session(conf);
-    cmdline_run_saved(conf);
+    if (!loaded_conf_file)
+        cmdline_run_saved(conf);
+    conf_set_bool(conf, CONF_ws_proxy_enable, true);
 
     if (conf_get_int(conf, CONF_protocol) == PROT_SSH &&
         !conf_get_bool(conf, CONF_x11_forward) &&
