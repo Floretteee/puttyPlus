@@ -277,7 +277,7 @@ int main(int argc, char **argv)
     if (errors)
         return 1;
 
-    if (!cmdline_host_ok(conf)) {
+    if (!(loaded_conf_file ? conf_launchable(conf) : cmdline_host_ok(conf))) {
         fprintf(stderr, "puttyplus-term: no valid host name provided\n"
                 "try \"puttyplus-term --help\" for help\n");
         cmdline_arg_list_free(arglist);

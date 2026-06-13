@@ -273,7 +273,7 @@ void gui_term_process_cmdline(Conf *conf, char *cmdline)
 
     prepare_session(conf);
 
-    if (!demo_terminal_data && cmdline_host_ok(conf) &&
+    if (!demo_terminal_data && conf_launchable(conf) &&
         puttyplus_launch_windows_terminal(conf))
         cleanup_exit(0);
 }
