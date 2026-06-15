@@ -5,15 +5,32 @@
 
 #include "wsseat.h"
 
+#ifndef ENABLE_VIRTUAL_TERMINAL_INPUT
+#define ENABLE_VIRTUAL_TERMINAL_INPUT 0x0200
+#endif
+#ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
+#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
+#endif
+#ifndef DISABLE_NEWLINE_AUTO_RETURN
+#define DISABLE_NEWLINE_AUTO_RETURN 0x0008
+#endif
+
 static void ws_seat_echoedit_update(Seat *seat, bool echo, bool edit)
 {
     WsSeat *ws = container_of(seat, WsSeat, seat);
     DWORD mode = ENABLE_PROCESSED_INPUT;
     if (echo)
         mode |= ENABLE_ECHO_INPUT;
-    if (edit)
+    if (edit) {
         mode |= ENABLE_LINE_INPUT;
-    SetConsoleMode(ws->inhandle, mode);
+    } else {
+        mode |= ENABLE_VIRTUAL_TERMINAL_INPUT;
+        mode &= ~ENABLE_PROCESSED_INPUT;
+    }
+    if (!SetConsoleMode(ws->inhandle, mode) && (mode & ENABLE_VIRTUAL_TERMINAL_INPUT)) {
+        mode &= ~ENABLE_VIRTUAL_TERMINAL_INPUT;
+        SetConsoleMode(ws->inhandle, mode);
+    }
 }
 
 static size_t ws_seat_output(
@@ -150,8 +167,21 @@ void ws_seat_start_backend(WsSeat *ws)
     ws->outhandle = GetStdHandle(STD_OUTPUT_HANDLE);
     ws->errhandle = GetStdHandle(STD_ERROR_HANDLE);
 
+    {
+        DWORD outmode = 0;
+        if (GetConsoleMode(ws->outhandle, &outmode))
+            SetConsoleMode(ws->outhandle,
+                           outmode | ENABLE_VIRTUAL_TERMINAL_PROCESSING |
+                           DISABLE_NEWLINE_AUTO_RETURN);
+        if (GetConsoleMode(ws->errhandle, &outmode))
+            SetConsoleMode(ws->errhandle,
+                           outmode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    }
+
     GetConsoleMode(ws->inhandle, &ws->orig_console_mode);
-    SetConsoleMode(ws->inhandle, ENABLE_PROCESSED_INPUT);
+    SetConsoleMode(ws->inhandle,
+                   ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT |
+                   ENABLE_ECHO_INPUT);
 
     ws->stdout_handle = handle_output_new(
         ws->outhandle, ws_seat_stdouterr_sent, ws, 0);
